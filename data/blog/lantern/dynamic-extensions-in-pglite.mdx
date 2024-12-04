@@ -1,0 +1,153 @@
+---
+authors: [varik]
+date: 2024-07-12
+tags: [Postgres, Lantern]
+title: Dynamically loaded extensions in Postgres in the browser
+---
+
+# Dynamically loaded extensions in Postgres in the browser
+
+[Original Post](https://lantern.dev/blog/pglite-lantern)
+
+At a recent AGI House hackathon in San Francisco, we set out to run our Postgres vector extension directly in the browser. This would allow our documentation examples and small demos to be fully executable within the browser using a Postgres instance compiled to Wasm and running on the client browser.
+
+We built on top of [`pglite`](https://github.com/electric-sql/pglite), which uses a modified version of Postgres that enables running Postgres in the browser and NodeJS. We added support for dynamically loading extensions into `pglite`, and built an application demonstrating vector search inside the browser via dynamically loaded `lantern` and `pgvector` extensions.
+
+Head over to our [demo app](https://pglite.lantern.dev) to interact with a fully functional Postgres running inside the browser - The demo showcases geospatial search using vector indexes from Lantern. You can dynamically load extensions into a fully in-browser Wasm-compiled Postgres server, interact with the database via the Postgres psql shell, and more!
+
+## Goal
+
+With this project, we had the following goals:
+
+- Do vector search from inside the browser - This requires loading the `lantern` extension
+- Avoid loading unused extensions - We should only load an extension when it is actually necessary / included
+- Load extensions dynamically, from a separate compile unit - This ensures extensions can be compiled and added independently
+
+## Working Demo and Tested Extensions
+
+Here’s a quick demo video showcasing vector search, geospatial search, and encryption using Postgres extensions.
+
+```html
+<video controls>
+    <source src="https://storage.googleapis.com/lantern-blog/lantern-pglite-demo.mp4" type="video/mp4">
+</video>
+```
+
+Source code:
+
+- [Demo app](https://github.com/lanterndata/pglite-demo)
+- [`postgres-wasm` fork](https://github.com/lanterndata/postgres-wasm/tree/dlopen-support-wasm)
+- [`pglite` fork](https://github.com/lanterndata/pglite/tree/dynamic-extension-support)
+
+We have compiled and tested the following extensions:
+
+- [`lantern` control file](https://storage.googleapis.com/lantern-wasm/lantern-dev/lantern.control)
+- [`pgvector` control file](https://storage.googleapis.com/lantern-wasm/pgvector/vector.control)
+- [`pgcrypto` control file](https://storage.googleapis.com/lantern-wasm/pgcrypto/pgcrypto.control)
+
+## Technical Enhancements
+
+We relied heavily on the `pglite` project to get a basic Postgres setup running inside the browser. However, the project did not support dynamically loading extensions or compilation support for the specific extensions we had in mind.
+
+Below, we describe the more interesting hurdles we had to overcome to achieve our goals, building off of `pglite`.
+
+### Dynamic Linking Enabled
+
+Postgres loads extensions dynamically via `dlopen`. However, `dlopen` is not available via emscripten when the the program is not compiled as a main module (`MAIN_MODULE=1`).
+
+When compiling Postgres with `MAIN_MODULE=1` which also exports all the symbols defined in binary, we ran into a conflict with the `proc_exit` symbol, reserved by the WASI runtime.
+
+![Postgres Compilation Error](https://storage.googleapis.com/lantern-blog/pglite-error-compile.png)
+
+This was a bug in emscripten and we have opened [an issue](https://github.com/emscripten-core/emscripten/issues/22205) to follow up with a proper fix.
+
+Meanwhile renaming the offending symbol in Postgres source to `pg_proc_exit` resolved the issue, though it may break extensions that use the `proc_exit` function.
+
+Since emscripten implementation of `dlopen` requires the `fetch` API in browsers, we needed to add the `ASYNCIFY` flag to wrap the code in an asynchronous runtime.  As a result, we also needed to call the Postgres functions from JavaScript via `ccall`.
+
+![Diff to add ccall](https://storage.googleapis.com/lantern-blog/pglite-diff-ccall.png)
+
+### Function Pointer Casts Fix
+
+We needed to remove the `EMULATE_FUNCTION_POINTER_CASTS` flag, so we could dynamically resolve symbols using `dlsym`.
+
+Simply disabling it made the application crash since Postgres used dynamic function pointer casts in one instance of a query parse tree walker function with wrong arguments ([source](https://github.com/electric-sql/postgres-wasm/blob/wasm/src/backend/executor/execMain.c#L1609))
+
+![Postgres Null Error](https://storage.googleapis.com/lantern-blog/pglite-error-null.png)
+
+After some research we found a [patch](https://github.com/postgres/postgres/commit/c35ba141de1fa04373671ba24c73eb0fe4862415.patch) in Postgres upstream which resolved the issue in later Postgres versions. So, just backporting the patch allowed us to drop the `EMULATE_FUNCTION_POINTER_CASTS` flag.
+
+## Dynamically Loading Extensions
+
+### Allow loading non-existent web paths
+
+When loading an extension, Postgres wants to ensure the library file is already on the file system, but this is not the case when we load the extension via a URL. Commenting the relevant check in Postgres source code prevents the failure until we are able to inject the library file into the file system as discussed later.
+
+![Diff to allow web paths](https://storage.googleapis.com/lantern-blog/pglite-diff-paths.png)
+
+The `module_pathname` in the control file should contain the full URL or path to the extension Wasm file, but this will only be loaded when the `CREATE EXTENSION` statement is executed.
+
+Control file example:
+
+```plaintext
+comment = 'vector data type and ivfflat and hnsw access methods'
+default_version = '0.7.2'
+module_pathname = 'https://storage.googleapis.com/lantern-wasm/pgvector/vector.wasm'
+relocatable = true
+```
+
+We also needed to modify the `locateFile` function in `pglite` to handle URLs for extension Wasm files correctly.
+
+### Inject dynamic extension into WASM file system
+
+We adapted an existing extensions interface proposal ([PR](https://github.com/electric-sql/pglite/pull/99)) in `pglite`, and implemented necessary backend support to enable dynamically loading extensions.
+
+The property `pathOrUrl` should be a URL or path in a filesystem containing a control file, SQL script, and Wasm library for a specified extension.
+
+We added the `addExtension(name: string, extension: Extension)` function for registering extension control and SQL files after database initialization. With this API, it is not required to register all extensions beforehand, but they can also be registered via user interaction after the database is running (this is demonstrated in the [demo](https://pglite.lantern.dev/) app for the `pgcrypto` extension).
+
+Alternatively, if we know an extension will be necessary on startup, we can load it as the database gets initialized. On startup we will concurrently fetch control and corresponding SQL files for each of the specified extension and put them under the `$sharedir` in emscripten module filesystem. Then later the `CREATE EXTENSION` command can be used to fetch the Wasm file specified in `module_pathname` and dynamically load it.
+
+```javascript
+<script type="module">
+import { PGlite } from "../dist/index.js";
+
+// In-memory database:
+const pg = new PGlite({
+    extensions: {
+        lantern: {
+            // this path should contain lantern.control, lantern--$version.sql and lantern.wasm files
+            // the module_pathname in control file will be
+            // https://storage.googleapis.com/lantern-wasm/lantern-dev/lantern.wasm
+            pathOrUrl: 'https://storage.googleapis.com/lantern-wasm/lantern-dev',
+            setup: () => null,
+        },
+        vector: {
+            pathOrUrl: 'https://storage.googleapis.com/lantern-wasm/pgvector',
+            setup: () => null
+        },
+    }
+});
+
+await pg.waitReady;
+
+// We can create the extensions specified in startup configuration
+await pg.exec(`CREATE EXTENSION IF NOT EXISTS lantern;`);
+await pg.exec(`CREATE EXTENSION IF NOT EXISTS vector;`);
+
+// We can also load extension after DB has been started
+await window.pg.addExtension('pgcrypto', {
+    pathOrUrl: 'https://storage.googleapis.com/lantern-wasm/pgcrypto',
+    setup: () => null
+});
+await pg.exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+</script>
+```
+
+## Acknowledgements
+
+Special thanks to the authors of the `pglite` project, without which our journey of enabling Lantern in the web would take a lot longer.
+
+We would like to thank the authors of emscripten as well, for building a great library and for being very responsive when we reported an issue.
+
+The Wasm debugging [tutorial](https://developer.chrome.com/blog/wasm-debugging-2020/) by Ingvar Stepanyan was very helpful for building this demo as well. Consider listening through it when hacking with Wasm!
