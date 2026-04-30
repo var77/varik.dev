@@ -1,0 +1,35 @@
+---
+authors: [varik]
+date: 2026-04-30
+tags: [Postgres, Debugging, GDB, Talks, PgDay]
+title: PgDay Armenia 2026 — Debugging Postgres
+summary: Slides, demo, and code from my PgDay Armenia 2026 talk on debugging Postgres crashes with core dumps and GDB.
+---
+
+# PgDay Armenia 2026 — Debugging Postgres
+
+On April 30, 2026 I had the chance to give a talk at [PgDay Armenia 2026](https://pgdayarmenia.com/). The talk was about debugging Postgres in production: how to capture core dumps from crashing backends, attach GDB to a running process, and walk through the resulting traces to find the offending code in extensions and in Postgres itself. Below you can find the presentation, the live demo recording, and a link to the GitHub repo with the demo code.
+
+## Slides
+
+<iframe
+  src="https://view.officeapps.live.com/op/embed.aspx?src=https%3A%2F%2Fvarik.dev%2Fstatic%2Fpresentations%2Fpgday-debugging-postgres.pptx"
+  width="100%"
+  height="500"
+  frameBorder="0"
+  allowFullScreen
+/>
+
+You can also [download the deck](/static/presentations/pgday-debugging-postgres.pptx) directly.
+
+## Live Demo
+
+This is the recording of the demo I ran live during the talk — a Postgres extension that intentionally crashes the backend, the core dump it leaves behind, and walking the stack trace in GDB.
+
+<video src="/static/videos/pgday-debugging-postgres-demo.mp4" controls />
+
+## Code
+
+Slides, demo recording, and the full Dockerized demo (Postgres 18 with a crashing extension, core-dump setup, and GDB attach scripts) are on GitHub:
+
+[github.com/var77/pgday-armenia-2026](https://github.com/var77/pgday-armenia-2026)
