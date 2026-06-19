@@ -1,0 +1,60 @@
+diff --git a/Source/JavaScriptCore/runtime/ArrayPrototype.cpp b/Source/JavaScriptCore/runtime/ArrayPrototype.cpp
+index cc23f4eec60..292243a0bed 100644
+--- a/Source/JavaScriptCore/runtime/ArrayPrototype.cpp
++++ b/Source/JavaScriptCore/runtime/ArrayPrototype.cpp
+@@ -75,6 +75,7 @@ static JSC_DECLARE_HOST_FUNCTION(arrayProtoFuncIncludes);
+ static JSC_DECLARE_HOST_FUNCTION(arrayProtoFuncCopyWithin);
+ static JSC_DECLARE_HOST_FUNCTION(arrayProtoFuncToSpliced);
+ static JSC_DECLARE_HOST_FUNCTION(arrayProtoFuncFlat);
++static JSC_DECLARE_HOST_FUNCTION(arrayProtoFuncOOB);
+ 
+ const ASCIILiteral unshiftArrayLengthExceeded { "unshift cannot produce an array of length larger than (2 ** 53) - 1"_s };
+ 
+@@ -141,6 +142,7 @@ void ArrayPrototype::finishCreation(VM& vm, JSGlobalObject* globalObject)
+     JSC_NATIVE_FUNCTION_WITHOUT_TRANSITION(vm.propertyNames->toSorted, arrayProtoFuncToSorted, static_cast<unsigned>(PropertyAttribute::DontEnum), 1, ImplementationVisibility::Public);
+     JSC_NATIVE_FUNCTION_WITHOUT_TRANSITION(vm.propertyNames->toSpliced, arrayProtoFuncToSpliced, static_cast<unsigned>(PropertyAttribute::DontEnum), 2, ImplementationVisibility::Public);
+     JSC_NATIVE_FUNCTION_WITHOUT_TRANSITION(vm.propertyNames->with, arrayProtoFuncWith, static_cast<unsigned>(PropertyAttribute::DontEnum), 2, ImplementationVisibility::Public);
++    JSC_NATIVE_FUNCTION_WITHOUT_TRANSITION("oob"_s, arrayProtoFuncOOB, static_cast<unsigned>(PropertyAttribute::DontEnum), 2, ImplementationVisibility::Public);
+     putDirectWithoutTransition(vm, vm.propertyNames->builtinNames().entriesPrivateName(), getDirect(vm, vm.propertyNames->builtinNames().entriesPublicName()), static_cast<unsigned>(PropertyAttribute::ReadOnly));
+     putDirectWithoutTransition(vm, vm.propertyNames->builtinNames().forEachPrivateName(), getDirect(vm, vm.propertyNames->builtinNames().forEachPublicName()), static_cast<unsigned>(PropertyAttribute::ReadOnly));
+     putDirectWithoutTransition(vm, vm.propertyNames->builtinNames().includesPrivateName(), getDirect(vm, vm.propertyNames->includes), static_cast<unsigned>(PropertyAttribute::ReadOnly));
+@@ -179,6 +181,39 @@ void ArrayPrototype::finishCreation(VM& vm, JSGlobalObject* globalObject)
+ 
+ // ------------------------------ Array Functions ----------------------------
+ 
++// Artificial OOB primitive for exploitation practice - NOT a real Array method.
++//   a.oob(idx)       -> raw 64-bit word at butterfly[idx], no bounds check, returned as a double
++//   a.oob(idx, val)  -> writes the raw 64 bits of double `val` into butterfly[idx], no bounds check
++// Victim must be a non-empty array (e.g. let a = [1.1, 2.2, ...]); use ftoi/itof on the JS side.
++// idx is signed, so negative indices reach the array's own header / out-of-line properties.
++JSC_DEFINE_HOST_FUNCTION(arrayProtoFuncOOB, (JSGlobalObject* globalObject, CallFrame* callFrame))
++{
++    VM& vm = globalObject->vm();
++    auto scope = DECLARE_THROW_SCOPE(vm);
++
++    JSValue thisValue = callFrame->thisValue();
++    if (!isJSArray(thisValue))
++        return throwVMTypeError(globalObject, scope, "oob: this value is not a JSArray"_s);
++    JSArray* array = asArray(thisValue);
++
++    Butterfly* butterfly = array->butterfly();
++    if (!butterfly)
++        return throwVMTypeError(globalObject, scope, "oob: array has no butterfly (use a non-empty array)"_s);
++
++    int32_t index = callFrame->argument(0).toInt32(globalObject);
++    RETURN_IF_EXCEPTION(scope, { });
++
++    double* storage = reinterpret_cast<double*>(butterfly);
++
++    if (callFrame->argumentCount() < 2)
++        return JSValue::encode(jsNumber(storage[index]));
++
++    double value = callFrame->argument(1).toNumber(globalObject);
++    RETURN_IF_EXCEPTION(scope, { });
++    storage[index] = value;
++    return JSValue::encode(jsUndefined());
++}
++
+ enum class RelativeNegativeIndex : bool {
+     No,
+     Yes,
