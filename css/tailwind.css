@@ -58,3 +58,10 @@ input:-webkit-autofill:focus {
   display: inline-block;
   vertical-align: middle;
 }
+
+/* animated connector for ArchAnim diagrams */
+@keyframes archdash {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
