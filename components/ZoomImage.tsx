@@ -7,9 +7,9 @@ import Image from './Image'
 
 const basePath = process.env.BASE_PATH
 
-const ZoomImage = (props: ImageProps) => {
+const ZoomImage = ({ alt, ...rest }: ImageProps) => {
   const [open, setOpen] = useState(false)
-  const src = typeof props.src === 'string' ? `${basePath || ''}${props.src}` : null
+  const src = typeof rest.src === 'string' ? `${basePath || ''}${rest.src}` : null
 
   useEffect(() => {
     if (!open) return
@@ -23,7 +23,7 @@ const ZoomImage = (props: ImageProps) => {
     }
   }, [open])
 
-  if (!src) return <Image {...props} />
+  if (!src) return <Image alt={alt} {...rest} />
 
   return (
     <>
@@ -31,21 +31,22 @@ const ZoomImage = (props: ImageProps) => {
         type="button"
         onClick={() => setOpen(true)}
         className="block cursor-zoom-in"
-        aria-label={`Zoom image: ${props.alt}`}
+        aria-label={`Zoom image: ${alt}`}
       >
-        <Image {...props} />
+        <Image alt={alt} {...rest} />
       </button>
       {open &&
         createPortal(
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label={props.alt}
-            onClick={() => setOpen(false)}
-            className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/90 p-4"
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={src} alt={props.alt} className="max-h-full max-w-full object-contain" />
+          <div role="dialog" aria-modal="true" aria-label={alt} className="fixed inset-0 z-50">
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              aria-label="Close image"
+              className="flex h-full w-full cursor-zoom-out items-center justify-center bg-black/90 p-4"
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={src} alt={alt} className="max-h-full max-w-full object-contain" />
+            </button>
           </div>,
           document.body
         )}
