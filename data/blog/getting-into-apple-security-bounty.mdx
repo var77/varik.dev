@@ -33,7 +33,7 @@ The problem was that I had no clue where to start. Unlike other targets, there i
 
 Luckily, this spring I was reading the security notes of an iOS release and spotted an Armenian surname there. (If you're Armenian, you know how we look for "-yan"/"-ian" surnames in the movie credits :D )
 
-It was Vahagn Vardanian (https://x.com/vah_13), a researcher with many high-impact CVEs on different targets. I reached out and asked for advice, and he kindly answered (thank you!). TL;DR: the current macOS and iOS kernels and frameworks are very similar, so I could just start auditing on macOS. A bug there would most probably carry over to iOS.
+It was [Vahagn Vardanian](https://x.com/vah_13), a researcher with many high-impact CVEs on different targets. I reached out and asked for advice, and he kindly answered (thank you!). TL;DR: the current macOS and iOS kernels and frameworks are very similar, so I could just start auditing on macOS. A bug there would most probably carry over to iOS.
 
 ## The first bug
 
@@ -51,7 +51,7 @@ So in parallel I started reading write-ups and prior CVE PoCs, and doing hands-o
 
 ## Meeting GenericCoding
 
-Along the way I was lucky to meet GenericCoding (https://x.com/GenericCoding). Together we ported the DarkSword exploit chain on WebKit up to code execution with a PAC bypass. That work lives in the pois0nSword repo: https://github.com/GenericCoding/pois0nSword
+Along the way I was lucky to meet [GenericCoding](https://x.com/GenericCoding). Together we ported the DarkSword exploit chain on WebKit up to code execution with a PAC bypass. That work lives in the [pois0nSword](https://github.com/GenericCoding/pois0nSword) repo.
 
 We became good friends, and it pushed both the learning and the bug hunting forward for both of us. GenericCoding also shared a ton of great material on iOS security and the kernel with me (thank you!). Most of the kernel resources below came from there.
 
@@ -71,7 +71,7 @@ This is the backbone. You need at least the basic ARM instructions. What I did:
 
 Resources that helped:
 
-- Practical ARM Assembly Tutorial Series from LaurieWired: https://www.youtube.com/watch?v=kKtWsuuJEDs&list=PLn_It163He32Ujm-l_czgEBhbJjOUgFhg
+- [Practical ARM Assembly Tutorial Series](https://www.youtube.com/watch?v=kKtWsuuJEDs&list=PLn_It163He32Ujm-l_czgEBhbJjOUgFhg) from LaurieWired
 - Create and exploit a simple stack buffer overflow challenge by hand:
 
 ```c
@@ -96,15 +96,19 @@ int main() {
 
 A lot of iOS code, especially the private frameworks, is written in Objective-C. Knowing the language and a few exploitation techniques will always come in handy.
 
-Phrack issue 0x45 has a very good article on the ObjC runtime and attack techniques: https://phrack.org/issues/69/modern-objective-c-exploitation-techniques
+Phrack issue 0x45 has a very good article on the ObjC runtime and attack techniques: [Modern Objective-C Exploitation Techniques](https://phrack.org/issues/69/modern-objective-c-exploitation-techniques).
 
 It's outdated now, and some of the techniques have been hardened enough that they don't easily work anymore. It's still great for learning the basics.
 
-The "iOS Application Exploitation Challenges" from 8ksec are also very good: https://academy.8ksec.io/course/ios-application-exploitation-challenges
+The [iOS Application Exploitation Challenges](https://academy.8ksec.io/course/ios-application-exploitation-challenges) from 8ksec are also very good.
 
-You'll mostly learn dynamic instrumentation and patching, ObjC function hooking and reversing iOS apps. To run them you can use vphone-cli (https://github.com/Lakr233/vphone-cli). It gives you a virtual, fully working jailbroken iPhone on your Mac, running a recent iOS version.
+You'll mostly learn dynamic instrumentation and patching, ObjC function hooking and reversing iOS apps. To run them you can use [vphone-cli](https://github.com/Lakr233/vphone-cli). It gives you a virtual, fully working jailbroken iPhone on your Mac, running a recent iOS version.
 
-The challenges expect you to use Frida. I'd suggest writing plain C instead. You'll understand much better what happens under the hood. As root on a jailbroken device, you get the target's task port and then work with its memory through the Mach VM API:
+The challenges expect you to use Frida. I'd suggest writing plain C instead. You'll understand much better what happens under the hood.
+
+First, make the target `CS_DEBUGGED`: `ptrace(PT_ATTACHEXC)`, wait for the `SIGSTOP`, `ptrace(PT_DETACH)`, then send `SIGCONT`. Without it you can't allocate anonymous executable pages or flip pages between RW and RX, so no patching.
+
+Then, as root on a jailbroken device, you get the target's task port and work with its memory through the Mach VM API:
 
 ```c
 task_for_pid(mach_task_self(), pid, &task);                       // the target's task port
@@ -115,20 +119,18 @@ vm_protect(task, addr, len, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
 vm_write(task, addr, (vm_offset_t)code, len);                     // patch it
 ```
 
-On Darwin, `ptrace` itself only does attach and detach (`PT_ATTACHEXC`, `PT_DETACH`). Everything else goes through the task port.
-
 ### JSC & WebKit
 
 General browser exploitation techniques carry over to JavaScriptCore and WebKit. What's left to learn is PAC bypasses, iOS XPC and sandboxing.
 
-- https://blog.ret2.io/2021/06/02/pwn2own-2021-jsc-exploit/
-- https://phrack.org/issues/70/attacking-javascript-engines-a-case-study-of-javascriptcore-and-cve-2016-4622
-- https://arxiv.org/html/2610.10844v1
+- RET2, [32 bits, 32 gigs, 1 click...](https://blog.ret2.io/2021/06/02/pwn2own-2021-jsc-exploit/)
+- Phrack, [Attacking JavaScript Engines: A case study of JavaScriptCore and CVE-2016-4622](https://phrack.org/issues/70/attacking-javascript-engines-a-case-study-of-javascriptcore-and-cve-2016-4622)
+- [When Flaws Cascade: Understanding Vulnerabilities and Exploitation Chains in JavaScript Engines](https://arxiv.org/html/2610.10844v1)
 
 I also have a 2-part series on JSC:
 
-- https://varik.dev/blog/jsc/jsc-exploitation-primitives-part-1
-- https://varik.dev/blog/jsc/pois0nsword-native-calls
+- [JSC Exploitation Primitives - Part 1: From One OOB to Cage-Free Arbitrary R/W](/blog/jsc/jsc-exploitation-primitives-part-1)
+- [pois0nSword: From Renderer R/W to Native Calls on iOS 26.1](/blog/jsc/pois0nsword-native-calls)
 
 The best way to learn JSC exploitation is to reproduce prior CVEs on vulnerable versions.
 
@@ -138,17 +140,17 @@ I think this is the hardest part. Recent iOS versions and iPhone chips have tons
 
 #### Basics
 
-- https://projectzero.google/2019/02/examining-pointer-authentication-on.html
-- https://bazad.github.io/
-- https://alfiecg.uk/2025/03/01/Trigon.html
-- https://www.youtube.com/watch?v=rPTifU1lG7Q
-- https://www.youtube.com/watch?v=_YAmsAwSEHA
+- Project Zero, [Examining Pointer Authentication on the iPhone XS](https://projectzero.google/2019/02/examining-pointer-authentication-on.html)
+- [Brandon Azad's blog](https://bazad.github.io/)
+- [Trigon: developing a deterministic kernel exploit for iOS](https://alfiecg.uk/2025/03/01/Trigon.html)
+- Linus Henze, [Fugu15 - The Journey to Jailbreaking iOS 15.4.1](https://www.youtube.com/watch?v=rPTifU1lG7Q) (OBTS v5.0)
+- Luca Todesco, [Life as an iOS Attacker](https://www.youtube.com/watch?v=_YAmsAwSEHA) (BlueHat IL 2019)
 
 #### Modern hardening
 
-- https://www.youtube.com/watch?v=lU2lxGtLN6k
-- https://www.youtube.com/watch?v=JNHfU2hnlFA
-- https://arxiv.org/pdf/2510.09272
+- Lars Fröder, [State of iOS Jailbreaking in 2025](https://www.youtube.com/watch?v=lU2lxGtLN6k) (Nullcon Goa 2025)
+- Jonathan Levin, [Make XNU GREAT Little Again](https://www.youtube.com/watch?v=JNHfU2hnlFA) (OBTS v8.0)
+- [Modern iOS Security Features - A Deep Dive into SPTM, TXM, and Exclaves](https://arxiv.org/pdf/2510.09272)
 
 #### XNUSP - a hands-on kernel CLI to build yourself
 
@@ -162,13 +164,13 @@ The lab is a step-by-step exercise. Along the way you'll learn:
 - which privilege levels exist below and above the kernel
 - how to walk the page tables and do `VA <-> PA` translation by hand at each level
 
-It's a bit long, so it has its own post: https://varik.dev/blog/xnu/xnusp-xnu-learning-lab
+It's a bit long, so it has [its own post](/blog/xnu/xnusp-xnu-learning-lab).
 
 ![xnusp vmmap on a vphone VM: kernel_map regions read through tfp0, with protections, zone tags and resident pages](/static/images/apple-bb/xnusp-vmmap.png)
 
 ### Playing with a jailbroken iPhone
 
-I was lucky to be one of the few people who knew about the recent TSS bug. I got my iPhone 15 Pro (iOS 27.2 beta) jailbroken before it was patched. You can read more about the bug on hrtowii's (https://x.com/hrtowii) blog: https://www.hrtowii.dev/blog/making-a-not-jailbreak-in-3-weeks
+I was lucky to be one of the few people who knew about the recent TSS bug. I got my iPhone 15 Pro (iOS 27.2 beta) jailbroken before it was patched. You can read more about the bug in [hrtowii](https://x.com/hrtowii)'s post [Making a not-jailbreak in 3 weeks](https://www.hrtowii.dev/blog/making-a-not-jailbreak-in-3-weeks).
 
 With root on a real device I got to see how different mitigations behave once you have root:
 
@@ -186,27 +188,27 @@ Unfortunately the TSS bug is patched now. It allowed signing arbitrary Cryptexes
 
 Read ANY iOS/macOS blog post from Google Project Zero. They're the best material in the field. A few to start with:
 
-- https://projectzero.google/2020/01/remote-iphone-exploitation-part-1.html
-- https://projectzero.google/2020/01/remote-iphone-exploitation-part-2.html
-- https://projectzero.google/2020/01/remote-iphone-exploitation-part-3.html
-- https://projectzero.google/2023/10/an-analysis-of-an-in-the-wild-ios-safari-sandbox-escape.html
-- https://projectzero.google/2019/08/jsc-exploits.html
+- [Remote iPhone Exploitation Part 1: Poking Memory via iMessage and CVE-2019-8641](https://projectzero.google/2020/01/remote-iphone-exploitation-part-1.html)
+- [Remote iPhone Exploitation Part 2: Bringing Light into the Darkness - a Remote ASLR Bypass](https://projectzero.google/2020/01/remote-iphone-exploitation-part-2.html)
+- [Remote iPhone Exploitation Part 3: From Memory Corruption to JavaScript and Back - Gaining Code Execution](https://projectzero.google/2020/01/remote-iphone-exploitation-part-3.html)
+- [An analysis of an in-the-wild iOS Safari WebContent to GPU Process exploit](https://projectzero.google/2023/10/an-analysis-of-an-in-the-wild-ios-safari-sandbox-escape.html)
+- [JSC Exploits](https://projectzero.google/2019/08/jsc-exploits.html)
 
 ## Environment setup
 
 ### Skills & tools
 
-The most important tool when starting with iOS is ipsw: https://github.com/blacktop/ipsw
+The most important tool when starting with iOS is [ipsw](https://github.com/blacktop/ipsw).
 
 It downloads different iOS firmware versions, extracts components from the dyld cache, parses entitlements and more. It's also easy for LLMs to drive, which makes it great for agentic work.
 
 Most private system frameworks are closed-source, so next you need a disassembler:
 
-- **Ghidra** with https://github.com/cellebrite-labs/ghidra-rpc for autonomous analysis
-- **IDA Pro** with https://github.com/cellebrite-labs/ida-bridge, plus these plugins for more comfortable reversing on iOS:
-  - https://github.com/cellebrite-labs/PacXplorer
-  - https://github.com/cellebrite-labs/ida_kernelcache
-  - https://github.com/cellebrite-labs/FunctionInliner
+- **Ghidra** with [ghidra-rpc](https://github.com/cellebrite-labs/ghidra-rpc) for autonomous analysis
+- **IDA Pro** with [ida-bridge](https://github.com/cellebrite-labs/ida-bridge), plus these plugins for more comfortable reversing on iOS:
+  - [PacXplorer](https://github.com/cellebrite-labs/PacXplorer)
+  - [ida_kernelcache](https://github.com/cellebrite-labs/ida_kernelcache)
+  - [FunctionInliner](https://github.com/cellebrite-labs/FunctionInliner)
 
 P.S. Thanks to Cellebrite for these tools.
 
@@ -315,7 +317,7 @@ I have small bash wrapper scripts that set the provider URL and API key, so I ca
 
 Recently Apple added Target Flags to the bounty program, which makes hunting a bit like a CTF. When you have a bug, you capture the target flag with your PoC, and you get a higher payout and faster triage (although triage has been so slow lately that I doubt that part).
 
-Target flags include register control, PC control, TCC flags and more. You can read more here: https://security.apple.com/bounty/target-flags/
+Target flags include register control, PC control, TCC flags and more. You can read more in Apple's [Target Flags docs](https://security.apple.com/bounty/target-flags/).
 
 ## Closing notes
 
