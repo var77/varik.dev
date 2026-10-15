@@ -1,0 +1,324 @@
+---
+authors: [varik]
+date: 2026-10-15
+draft: false
+tags: [iOS, macOS, Apple, Bug Bounty, XNU, JSC]
+title: 'Getting into Apple Security Bounty'
+summary: 'How I went from CTFs to my first Apple CVE in a few months: what I read, what I built, the tools I use and how I work with agents without becoming a meat proxy.'
+images: ['/static/images/apple-bb/og-getting-into-apple-security-bounty.png']
+---
+
+**TL;DR:** for the past few months I have been hunting bugs in the Apple ecosystem, and some of my reports made it into the latest security release notes:
+
+- **CVE-2026-65395** - an out-of-bounds write in ImageIO: processing a maliciously crafted image may result in memory corruption. It's shared with Google Project Zero, but my report came first, so Apple paid me a $1k bounty for it.
+- **An acknowledgement** in Calendar for a heap OOB write in the vCalendar 1.0 parser (iCalendar.framework).
+
+![Apple security release notes: CVE-2026-65395 in ImageIO and the Calendar acknowledgement, both crediting Varik Matevosyan](/static/images/apple-bb/security-release-notes.png)
+
+In this post I'll share how I got started, what I learned along the way, how I set up my environment and what my workflow looks like. If you've been wanting to start on Apple but don't know where, this one is for you.
+
+## How it started
+
+I've been using Apple products since 2012. I was 11, and my first one was an iPad 3. I remember jailbreaking it and installing tweaks from Cydia (my favourite was LocalIAPStore :) ).
+
+Years passed. I went through iPhones of different generations and started working in tech. Blog posts about spyware analysis and 1-click/0-click iOS exploits kept showing up in my feed, and finding bugs on Apple devices became a dream of mine.
+
+## Hesitating, and getting a direction
+
+With that dream in mind I mostly did CTFs and other fun security challenges. They helped me understand memory-safety bugs and exploitation techniques. But I kept hesitating to start auditing real targets.
+
+At the start of this year I finally set a goal: start security research on Apple. LLMs were getting better fast, and they could speed up the setup and prep work that used to take months.
+
+The problem was that I had no clue where to start. Unlike other targets, there isn't much on the internet to guide you here. Should I buy an old iPhone, jailbreak it and install instrumentation tools? Or should I start with reversing first...?
+
+Luckily, this spring I was reading the security notes of an iOS release and spotted an Armenian surname there. (If you're Armenian, you know how we look for "-yan"/"-ian" surnames in the movie credits :D )
+
+It was [Vahagn Vardanian](https://x.com/vah_13), a researcher with many high-impact CVEs on different targets. I reached out and asked for advice, and he kindly answered (thank you!). TL;DR: the current macOS and iOS kernels and frameworks are very similar, so I could just start auditing on macOS. A bug there would most probably carry over to iOS.
+
+## The first bug
+
+So that's what I did. I set up the environment on macOS and started hunting. About two weeks in, I found my first bug: a heap OOB write in the vCalendar 1.0 parser of iCalendar.framework. It ended up as the Calendar acknowledgement.
+
+About a month later, I found the ImageIO out-of-bounds write, which became my first CVE.
+
+## Not a meat proxy
+
+I know that in this agentic era you don't really need to understand what's going on in depth. You can point your agent at a target, tell it "find a vulnerability there, make no mistakes", and it will most probably find something. Then you just check it's not a false positive.
+
+But it's no fun for me to just act as a meat proxy for the agent :)
+
+So in parallel I started reading write-ups and prior CVE PoCs, and doing hands-on exploitation challenges on ARM64, iOS and macOS. I wanted to actually understand the world I was hunting in.
+
+## Meeting GenericCoding
+
+Along the way I was lucky to meet [GenericCoding](https://x.com/GenericCoding). Together we ported the DarkSword exploit chain on WebKit up to code execution with a PAC bypass. That work lives in the [pois0nSword](https://github.com/GenericCoding/pois0nSword) repo.
+
+We became good friends, and it pushed both the learning and the bug hunting forward for both of us. GenericCoding also shared a ton of great material on iOS security and the kernel with me (thank you!). Most of the kernel resources below came from there.
+
+So my advice: share your progress on Twitter and find people you can push each other with. It keeps you motivated :)
+
+## Learning materials
+
+Here's what I read, watched and did, grouped by topic.
+
+### ARM64
+
+This is the backbone. You need at least the basic ARM instructions. What I did:
+
+1. Wrote a hello-world in ARM64 assembly
+2. Played with stack frames and branches, and looked at how they differ from x64
+3. Tried the PAC instructions in assembly (paciza, pacib, autia, autib)
+
+Resources that helped:
+
+- [Practical ARM Assembly Tutorial Series](https://www.youtube.com/watch?v=kKtWsuuJEDs&list=PLn_It163He32Ujm-l_czgEBhbJjOUgFhg) from LaurieWired
+- Create and exploit a simple stack buffer overflow challenge by hand:
+
+```c
+void win() {
+  printf("You won\n");
+  exit(0);
+}
+
+int main() {
+  char buf[32] = {0};
+
+  puts("Input to buffer");
+  read(0, &buf, 256);
+  printf("Your buf: %s \n", buf);
+  return 0;
+}
+```
+
+- Compare the arm64 and arm64e builds of it (the latter uses PAC instructions)
+
+### ObjC
+
+A lot of iOS code, especially the private frameworks, is written in Objective-C. Knowing the language and a few exploitation techniques will always come in handy.
+
+Phrack issue 0x45 has a very good article on the ObjC runtime and attack techniques: [Modern Objective-C Exploitation Techniques](https://phrack.org/issues/69/modern-objective-c-exploitation-techniques).
+
+It's outdated now, and some of the techniques have been hardened enough that they don't easily work anymore. It's still great for learning the basics.
+
+The [iOS Application Exploitation Challenges](https://academy.8ksec.io/course/ios-application-exploitation-challenges) from 8ksec are also very good.
+
+You'll mostly learn dynamic instrumentation and patching, ObjC function hooking and reversing iOS apps. To run them you can use [vphone-cli](https://github.com/Lakr233/vphone-cli). It gives you a virtual, fully working jailbroken iPhone on your Mac, running a recent iOS version.
+
+The challenges expect you to use Frida. I'd suggest writing plain C instead. You'll understand much better what happens under the hood.
+
+First, make the target `CS_DEBUGGED`: `ptrace(PT_ATTACHEXC)`, wait for the `SIGSTOP`, `ptrace(PT_DETACH)`, then send `SIGCONT`. Without it you can't allocate anonymous executable pages or flip pages between RW and RX, so no patching.
+
+Then, as root on a jailbroken device, you get the target's task port and work with its memory through the Mach VM API:
+
+```c
+task_for_pid(mach_task_self(), pid, &task);                       // the target's task port
+task_info(task, TASK_DYLD_INFO, (task_info_t)&dyld_info, &count); // find the loaded images
+vm_read_overwrite(task, addr, len, (vm_address_t)buf, &got);      // read its memory
+vm_allocate(task, &page, vm_page_size, VM_FLAGS_ANYWHERE);        // allocate a page in it
+vm_protect(task, addr, len, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+vm_write(task, addr, (vm_offset_t)code, len);                     // patch it
+```
+
+### JSC & WebKit
+
+General browser exploitation techniques carry over to JavaScriptCore and WebKit. What's left to learn is PAC bypasses, iOS XPC and sandboxing.
+
+- RET2, [32 bits, 32 gigs, 1 click...](https://blog.ret2.io/2021/06/02/pwn2own-2021-jsc-exploit/)
+- Phrack, [Attacking JavaScript Engines: A case study of JavaScriptCore and CVE-2016-4622](https://phrack.org/issues/70/attacking-javascript-engines-a-case-study-of-javascriptcore-and-cve-2016-4622)
+- [When Flaws Cascade: Understanding Vulnerabilities and Exploitation Chains in JavaScript Engines](https://arxiv.org/html/2610.10844v1)
+
+I also have a 2-part series on JSC:
+
+- [JSC Exploitation Primitives - Part 1: From One OOB to Cage-Free Arbitrary R/W](/blog/jsc/jsc-exploitation-primitives-part-1)
+- [pois0nSword: From Renderer R/W to Native Calls on iOS 26.1](/blog/jsc/pois0nsword-native-calls)
+
+The best way to learn JSC exploitation is to reproduce prior CVEs on vulnerable versions.
+
+### XNU kernel
+
+I think this is the hardest part. Recent iOS versions and iPhone chips have tons of hardening. I read a lot and watched a lot of conference talks to get a feel for the kernel components. Here are some of them.
+
+#### Basics
+
+- Project Zero, [Examining Pointer Authentication on the iPhone XS](https://projectzero.google/2019/02/examining-pointer-authentication-on.html)
+- [Brandon Azad's blog](https://bazad.github.io/)
+- [Trigon: developing a deterministic kernel exploit for iOS](https://alfiecg.uk/2025/03/01/Trigon.html)
+- Linus Henze, [Fugu15 - The Journey to Jailbreaking iOS 15.4.1](https://www.youtube.com/watch?v=rPTifU1lG7Q) (OBTS v5.0)
+- Luca Todesco, [Life as an iOS Attacker](https://www.youtube.com/watch?v=_YAmsAwSEHA) (BlueHat IL 2019)
+
+#### Modern hardening
+
+- Lars Fröder, [State of iOS Jailbreaking in 2025](https://www.youtube.com/watch?v=lU2lxGtLN6k) (Nullcon Goa 2025)
+- Jonathan Levin, [Make XNU GREAT Little Again](https://www.youtube.com/watch?v=JNHfU2hnlFA) (OBTS v8.0)
+- [Modern iOS Security Features - A Deep Dive into SPTM, TXM, and Exclaves](https://arxiv.org/pdf/2510.09272)
+
+#### XNUSP - a hands-on kernel CLI to build yourself
+
+To get hands-on with kernel internals, I built a lab for myself on vphone: a small CLI that does different things at the kernel level.
+
+For this you need a send right to the kernel task port, the one `task_for_pid(0)` returns, also called tfp0. That's not possible on modern iOS devices. But vphone-cli ships kernel patches, so you can do this research on a vphone VM.
+
+The lab is a step-by-step exercise. Along the way you'll learn:
+
+- how to work with kernel memory (the mach_vm* functions)
+- which privilege levels exist below and above the kernel
+- how to walk the page tables and do `VA <-> PA` translation by hand at each level
+
+It's a bit long, so it has [its own post](/blog/xnu/xnusp-xnu-learning-lab).
+
+![xnusp vmmap on a vphone VM: kernel_map regions read through tfp0, with protections, zone tags and resident pages](/static/images/apple-bb/xnusp-vmmap.png)
+
+### Playing with a jailbroken iPhone
+
+I was lucky to be one of the few people who knew about the recent TSS bug. I got my iPhone 15 Pro (iOS 27.2 beta) jailbroken before it was patched. You can read more about the bug in [hrtowii](https://x.com/hrtowii)'s post [Making a not-jailbreak in 3 weeks](https://www.hrtowii.dev/blog/making-a-not-jailbreak-in-3-weeks).
+
+With root on a real device I got to see how different mitigations behave once you have root:
+
+- Registering root launch daemons
+- Getting executable memory in other processes through a ptrace attach/detach trick that sets `CS_DEBUGGED`
+- Replacing SpringBoard with a custom-signed, modified one
+- Hooking amfid to skip provisioning profile checks
+- Patching real applications to bypass things :P
+
+![Root shell on my jailbroken iPhone 15 Pro: neofetch, id, uname -a and the /var/jb symlink](/static/images/apple-bb/jailbreak-neofetch.png)
+
+Unfortunately the TSS bug is patched now. It allowed signing arbitrary Cryptexes and having fun, but you can't try it anymore.
+
+### General
+
+Read ANY iOS/macOS blog post from Google Project Zero. They're the best material in the field. A few to start with:
+
+- [Remote iPhone Exploitation Part 1: Poking Memory via iMessage and CVE-2019-8641](https://projectzero.google/2020/01/remote-iphone-exploitation-part-1.html)
+- [Remote iPhone Exploitation Part 2: Bringing Light into the Darkness - a Remote ASLR Bypass](https://projectzero.google/2020/01/remote-iphone-exploitation-part-2.html)
+- [Remote iPhone Exploitation Part 3: From Memory Corruption to JavaScript and Back - Gaining Code Execution](https://projectzero.google/2020/01/remote-iphone-exploitation-part-3.html)
+- [An analysis of an in-the-wild iOS Safari WebContent to GPU Process exploit](https://projectzero.google/2023/10/an-analysis-of-an-in-the-wild-ios-safari-sandbox-escape.html)
+- [JSC Exploits](https://projectzero.google/2019/08/jsc-exploits.html)
+
+## Environment setup
+
+### Skills & tools
+
+The most important tool when starting with iOS is [ipsw](https://github.com/blacktop/ipsw).
+
+It downloads different iOS firmware versions, extracts components from the dyld cache, parses entitlements and more. It's also easy for LLMs to drive, which makes it great for agentic work.
+
+Most private system frameworks are closed-source, so next you need a disassembler:
+
+- **Ghidra** with [ghidra-rpc](https://github.com/cellebrite-labs/ghidra-rpc) for autonomous analysis
+- **IDA Pro** with [ida-bridge](https://github.com/cellebrite-labs/ida-bridge), plus these plugins for more comfortable reversing on iOS:
+  - [PacXplorer](https://github.com/cellebrite-labs/PacXplorer)
+  - [ida_kernelcache](https://github.com/cellebrite-labs/ida_kernelcache)
+  - [FunctionInliner](https://github.com/cellebrite-labs/FunctionInliner)
+
+P.S. Thanks to Cellebrite for these tools.
+
+With these two plus macOS for building and running PoCs and harnesses, you can pick a target and let the agent start auditing it.
+
+But a standard setup like this is unlikely to find anything interesting. One skill I added is a list of memory-corruption patterns I picked up from CTFs: unbounded `memcpy`, integer overflow/underflow, ways to target UAF bugs, plus some example C code for reference.
+
+The exercises and materials above help here too. You'll get a feel for where each component is more likely to break. Then you can steer your agent to a narrower scope, which leads to better findings.
+
+It also helps to tell the agent about all the testing tools it can use:
+
+1. Creating isolated harnesses and verifying bugs
+2. Building, deploying and running an app on an iPhone and collecting its logs with `xcrun devicectl`, so it can test without you
+3. Debugging on the Mac with lldb and Python scripts
+
+### Private frameworks
+
+At first you can verify a framework bug with a small isolated harness on macOS:
+
+```c
+void *h = dlopen("/System/Library/PrivateFrameworks/Target.framework/Target", RTLD_NOW);
+int (*target_fn)(const void *, size_t) = dlsym(h, "symbol_you_are_testing");
+
+target_fn(your_input, your_input_len);
+```
+
+For Objective-C classes, `dlopen` the framework and then grab the class with `NSClassFromString(@"ClassName")`.
+
+Once you've confirmed the bug is in the framework, make sure it's also reachable from a first-party Apple shipping binary: QuickLook, Calendar, Safari, etc. Without proof of reachability, Apple may reject the report.
+
+When it's reachable, grab the crash `*.ips` log (for memory-corruption bugs) and attach it to the report. I usually record a demo video too, so triagers see the proof at a glance. If you have a physical iPhone, test the file there as well and include the iPhone crash log.
+
+One tip for auditing on macOS: disable the SIP debug restrictions. Then you can attach lldb to system processes and debug crashes properly, which helps a lot when turning a crash into an exploit.
+
+### Root daemons
+
+For daemons you need a device on the latest firmware. vphone may also work, but make sure the apps there run sandboxed and without extra entitlements, just like on a real iPhone. Otherwise you can't trust what your app can reach.
+
+Pick a target daemon and decompile it. Apps reach a daemon through IPC calls (XPC, MIG), which are all Mach messages under the hood. So find its IPC handlers and dig into them.
+
+First check that an app can even reach it. The sandbox profile has to allow `mach-lookup` of the daemon's service name, so you can get a send right to its port. Then enumerate the messages and see which ones it accepts.
+
+After that it's about finding logic bugs (like missing authorization) or memory bugs in message parsing, and exploiting them through IPC. Root daemons are also useful for TCC bypasses, or as a sandbox escape if you're building a full chain.
+
+### Kernel & kexts
+
+Here you'll most likely need a real device. It gives you real panic logs, and you can test the real hardware drivers, which vphone doesn't have. A jailbroken device speeds things up a lot once the static analysis is done and you move to iterating and fuzzing.
+
+Kernel bugs are generally valued higher than bugs in private frameworks and daemons.
+
+Most of the time you'll be fuzzing IOKit drivers. IOKit user clients (IOSurface, IOMobileFramebuffer, etc.) are the common way for userland to talk to kexts. The higher-level wrapper functions that build the IOKit call arguments often do the input sanitization themselves. If you build those calls manually, you skip that sanitization, and that can lead to memory corruption on the kext side.
+
+That said, memory corruption in the kernel is very hard to exploit these days. `kalloc_type` isolates allocations by type, so reclaiming a freed object with something useful is much harder, and PAC and SPTM add more layers on top.
+
+### WebKit & JSC
+
+Prior browser exploitation skills help a lot here, mostly in knowing which engine components deserve more attention.
+
+You don't need an iPhone at all. The whole audit can be done on a Mac. Test your bugs and exploits on Safari Technology Preview, and check that the bug isn't already fixed on WebKit's main branch, to avoid duplicates.
+
+An ASAN build of WebKit and a debug build of JSC help a lot with debugging. Just be ready for the build artifacts: they take around 70GB.
+
+## Prompting guides
+
+- **Give it context.** Prior CVEs and write-ups give your agent ideas about where bugs are more likely to be.
+- **Be careful with auto-memory files.** They can be useful, but they can also hurt. After many audit sessions without good results recorded in memory, the agent becomes very skeptical. It starts assuming the target is heavily fuzzed and hardened, jumps to conclusions and stops doing deep analysis.
+- **Motivate it.** Sometimes the agent comes back saying the analysis is clean, or that the bug isn't exploitable, but you can already smell the `0x41414141` in your crash logs. Believe it or not, just saying "there is a bug, you just didn't check well enough" or "I think it's exploitable, just try it, you can do it" leads to better results. (You can also promise it a vacation in Hawaii if it finds a bug lol)
+- **Make agents discuss with each other.** This is a technique I like a lot. Discussing ideas across different agents (Claude, GLM, DeepSeek, MiMo) leads to better results, and helps an agent get unstuck. (I didn't mention GPT because of their shitty verification system. People outside the US have a very hard time passing the cyber verification.)
+
+To let Claude Code sessions talk to each other, I use a small script, `peers.py`. Every live session keeps a file in `~/.claude/sessions/<pid>.json` with its pid, cwd and messaging name. The script lists the sessions whose cwd is inside the audit repo, so an agent knows who to `SendMessage`:
+
+```python
+for f in (Path.home() / '.claude/sessions').glob('*.json'):
+    s = json.loads(f.read_text())
+    if alive(s['pid']) and Path(s['cwd']).resolve().is_relative_to(REPO):
+        print(s['name'], s['status'])
+```
+
+And in `AGENTS.md`:
+
+```markdown
+## Peer sessions
+
+Step 0 of any audit task: run `python3 tools/peers.py` to find other sessions on this repo.
+
+- The session a human prompts is the leader. A session that gets its task from a peer is a member.
+  Members report to the leader, not the human.
+- The leader writes `targets/<target>/TEAM.md`: who owns which surface. Read it before starting.
+- Message a peer when you're stuck, when a hypothesis needs an independent re-check from the
+  binary, or to split an enumerable surface (external methods, selectors) between members.
+- Send context, not pointers: the hypothesis, the evidence and what you already ruled out.
+```
+
+I have small bash wrapper scripts that set the provider URL and API key, so I can run different models inside Claude Code. That's why every pane below says "Claude session".
+
+![Three agents (mythos-5.1, deepseek-flash-v4.1, mimo-v2.6-pro) auditing WebKit in parallel and sending findings to each other](/static/images/apple-bb/multi-agent-workflow.png)
+
+## Triage: manual & automated
+
+1. **Understand the bug.** If it's too complex to understand from the PoC alone, ask the agent for an explanation report with visualizations, and work out where the bug is. This also helps you avoid false positives.
+2. **Reproduce it on a shipping binary.** Always validate that you can reproduce the crash on a shipping binary or kernel, capture the target flag if possible, or do the TCC bypass.
+3. **Watch for over-claiming.** Agents sometimes over-claim their findings. Say you have a memory corruption that can affect control flow, but it hits a PAC exception. The agent may still claim it can get arbitrary code execution.
+4. **Maximize the impact.** If it's a memory-safety issue like a UAF or an OOB read/write, always try to push it to maximum escalation and capture the target flags. You can report it as a crash first, then use the time until it's fully triaged to add more data and increase the impact.
+
+### Target Flags
+
+Recently Apple added Target Flags to the bounty program, which makes hunting a bit like a CTF. When you have a bug, you capture the target flag with your PoC, and you get a higher payout and faster triage (although triage has been so slow lately that I doubt that part).
+
+Target flags include register control, PC control, TCC flags and more. You can read more in Apple's [Target Flags docs](https://security.apple.com/bounty/target-flags/).
+
+## Closing notes
+
+That's it for now. A few months ago I didn't know where to start, and now I have my first Apple CVE. I also have a few more reports in the pipeline, so hopefully some of them land in the next update. If they do, I will write a separate post about them. I hope this post helps you get started on iOS and land your first CVE too. Good luck, and feel free to reach out!
